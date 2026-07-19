@@ -1,0 +1,27 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "accessory_config.c"
+        "ble_gap.c"
+        "gatt_client.c"
+        "hue_integration.c"
+        "live_data_decode.c"
+        "log_store.c"
+        "persistent_log.c"
+        "status_led.c"
+        "telemetry_export.c"
+        "wifi_admin.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        bt
+        esp_event
+        esp_driver_rmt
+        esp_http_server
+        esp_http_client
+        esp_netif
+        json
+        mdns
+        esp_wifi
+        nvs_flash
+        spiffs
+)
