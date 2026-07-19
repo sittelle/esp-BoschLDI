@@ -39,6 +39,7 @@ typedef struct {
 
 typedef struct {
     char bridge_host[ACCESSORY_HUE_HOST_MAX_LEN + 1];
+    char bridge_name[ACCESSORY_HUE_BRIDGE_NAME_MAX_LEN + 1];
 } hue_pair_task_arg_t;
 
 static SemaphoreHandle_t hue_pair_lock;
@@ -199,8 +200,10 @@ static esp_err_t hue_http_request(const char *url, esp_http_client_method_t meth
     return err;
 }
 
-static bool hue_discover_first_bridge(char *host, size_t host_len,
-                                      char *bridge_id, size_t bridge_id_len)
+static bool hue_discover_bridge(const char *requested_host,
+                                char *host, size_t host_len,
+                                char *bridge_id, size_t bridge_id_len,
+                                char *bridge_name, size_t bridge_name_len)
 {
     mdns_result_t *results = NULL;
     esp_err_t err = mdns_query_ptr(HUE_MDNS_SERVICE, HUE_MDNS_PROTO,
@@ -216,13 +219,25 @@ static bool hue_discover_first_bridge(char *host, size_t host_len,
 
     bool found = false;
     for (mdns_result_t *r = results; r != NULL && !found; r = r->next) {
+        char ip[20] = "";
         for (mdns_ip_addr_t *a = r->addr; a != NULL; a = a->next) {
             if (a->addr.type == ESP_IPADDR_TYPE_V4) {
-                snprintf(host, host_len, IPSTR, IP2STR(&a->addr.u_addr.ip4));
-                strlcpy(bridge_id, txt_value(r, "bridgeid"), bridge_id_len);
-                found = true;
+                snprintf(ip, sizeof(ip), IPSTR, IP2STR(&a->addr.u_addr.ip4));
                 break;
             }
+        }
+        if (ip[0] == '\0') {
+            continue;
+        }
+        bool match = requested_host == NULL || requested_host[0] == '\0' ||
+                     strcmp(requested_host, ip) == 0 ||
+                     (r->hostname != NULL && strcmp(requested_host, r->hostname) == 0);
+        if (match) {
+            strlcpy(host, ip, host_len);
+            strlcpy(bridge_id, txt_value(r, "bridgeid"), bridge_id_len);
+            strlcpy(bridge_name, r->instance_name != NULL ? r->instance_name : "",
+                    bridge_name_len);
+            found = true;
         }
     }
     mdns_query_results_free(results);
@@ -319,15 +334,32 @@ esp_err_t hue_integration_status_json(char *out, size_t out_len)
 {
     accessory_hue_config_t config;
     accessory_config_load_hue(&config);
+    if (config.app_key[0] != '\0' && config.bridge_name[0] == '\0') {
+        char discovered_host[ACCESSORY_HUE_HOST_MAX_LEN + 1] = "";
+        char discovered_id[ACCESSORY_HUE_BRIDGE_ID_MAX_LEN + 1] = "";
+        char discovered_name[ACCESSORY_HUE_BRIDGE_NAME_MAX_LEN + 1] = "";
+        if (hue_discover_bridge(config.bridge_host, discovered_host, sizeof(discovered_host),
+                                discovered_id, sizeof(discovered_id),
+                                discovered_name, sizeof(discovered_name)) &&
+            discovered_name[0] != '\0') {
+            strlcpy(config.bridge_name, discovered_name, sizeof(config.bridge_name));
+            if (config.bridge_id[0] == '\0') {
+                strlcpy(config.bridge_id, discovered_id, sizeof(config.bridge_id));
+            }
+            ESP_ERROR_CHECK_WITHOUT_ABORT(accessory_config_save_hue(&config));
+        }
+    }
 
     char host[96];
     char bridge_id[96];
+    char bridge_name[96];
     json_escape(host, sizeof(host), config.bridge_host);
     json_escape(bridge_id, sizeof(bridge_id), config.bridge_id);
+    json_escape(bridge_name, sizeof(bridge_name), config.bridge_name);
     snprintf(out, out_len,
              "{\"type\":\"hue_status\",\"paired\":%s,\"bridge_host\":\"%s\","
-             "\"bridge_id\":\"%s\",\"api\":\"v1-local-http\"}",
-             config.app_key[0] != '\0' ? "true" : "false", host, bridge_id);
+             "\"bridge_id\":\"%s\",\"bridge_name\":\"%s\",\"api\":\"v1-local-http\"}",
+             config.app_key[0] != '\0' ? "true" : "false", host, bridge_id, bridge_name);
     return ESP_OK;
 }
 
@@ -339,10 +371,16 @@ esp_err_t hue_integration_pair_json(const char *bridge_host, char *out, size_t o
 
     char selected_host[ACCESSORY_HUE_HOST_MAX_LEN + 1] = "";
     char bridge_id[ACCESSORY_HUE_BRIDGE_ID_MAX_LEN + 1] = "";
+    char bridge_name[ACCESSORY_HUE_BRIDGE_NAME_MAX_LEN + 1] = "";
     if (bridge_host != NULL && bridge_host[0] != '\0') {
         strlcpy(selected_host, bridge_host, sizeof(selected_host));
-    } else if (!hue_discover_first_bridge(selected_host, sizeof(selected_host),
-                                          bridge_id, sizeof(bridge_id))) {
+        char discovered_host[ACCESSORY_HUE_HOST_MAX_LEN + 1] = "";
+        hue_discover_bridge(selected_host, discovered_host, sizeof(discovered_host),
+                            bridge_id, sizeof(bridge_id),
+                            bridge_name, sizeof(bridge_name));
+    } else if (!hue_discover_bridge(NULL, selected_host, sizeof(selected_host),
+                                    bridge_id, sizeof(bridge_id),
+                                    bridge_name, sizeof(bridge_name))) {
         snprintf(out, out_len, "{\"type\":\"hue_pair\",\"paired\":false,"
                  "\"error\":\"no Hue Bridge discovered\"}");
         return ESP_ERR_NOT_FOUND;
@@ -395,6 +433,7 @@ esp_err_t hue_integration_pair_json(const char *bridge_host, char *out, size_t o
     accessory_hue_config_t config = {0};
     strlcpy(config.bridge_host, selected_host, sizeof(config.bridge_host));
     strlcpy(config.bridge_id, bridge_id, sizeof(config.bridge_id));
+    strlcpy(config.bridge_name, bridge_name, sizeof(config.bridge_name));
     strlcpy(config.app_key, app_key, sizeof(config.app_key));
     err = accessory_config_save_hue(&config);
     if (err != ESP_OK) {
@@ -405,12 +444,15 @@ esp_err_t hue_integration_pair_json(const char *bridge_host, char *out, size_t o
     }
 
     char escaped_bridge[96];
+    char escaped_name[96];
     json_escape(escaped_bridge, sizeof(escaped_bridge), bridge_id);
+    json_escape(escaped_name, sizeof(escaped_name), bridge_name);
     snprintf(out, out_len,
              "{\"type\":\"hue_pair\",\"paired\":true,\"bridge_host\":\"%s\","
-             "\"bridge_id\":\"%s\"}", selected_host, escaped_bridge);
-    persistent_log_event("info", "hue", "paired with bridge host=%s bridge_id=%s",
-                         selected_host, bridge_id);
+             "\"bridge_id\":\"%s\",\"bridge_name\":\"%s\"}",
+             selected_host, escaped_bridge, escaped_name);
+    persistent_log_event("info", "hue", "paired with bridge host=%s bridge_id=%s name=%s",
+                         selected_host, bridge_id, bridge_name);
     return ESP_OK;
 }
 
@@ -462,10 +504,13 @@ esp_err_t hue_integration_pair_start_json(const char *bridge_host, char *out, si
     accessory_config_load_hue(&config);
     if (config.app_key[0] != '\0') {
         char escaped_host[96];
+        char escaped_name[96];
         json_escape(escaped_host, sizeof(escaped_host), config.bridge_host);
+        json_escape(escaped_name, sizeof(escaped_name), config.bridge_name);
         snprintf(out, out_len,
                  "{\"type\":\"hue_pair_start\",\"running\":false,\"paired\":true,"
-                 "\"bridge_host\":\"%s\"}", escaped_host);
+                 "\"bridge_host\":\"%s\",\"bridge_name\":\"%s\"}",
+                 escaped_host, escaped_name);
         return ESP_OK;
     }
 
@@ -492,6 +537,13 @@ esp_err_t hue_integration_pair_start_json(const char *bridge_host, char *out, si
     }
     if (bridge_host != NULL) {
         strlcpy(task_arg->bridge_host, bridge_host, sizeof(task_arg->bridge_host));
+    }
+    if (task_arg->bridge_host[0] != '\0') {
+        char discovered_host[ACCESSORY_HUE_HOST_MAX_LEN + 1] = "";
+        char bridge_id[ACCESSORY_HUE_BRIDGE_ID_MAX_LEN + 1] = "";
+        hue_discover_bridge(task_arg->bridge_host, discovered_host, sizeof(discovered_host),
+                            bridge_id, sizeof(bridge_id),
+                            task_arg->bridge_name, sizeof(task_arg->bridge_name));
     }
 
     hue_pair_set_state(true, false, 0, task_arg->bridge_host,
@@ -528,6 +580,7 @@ esp_err_t hue_integration_pair_progress_json(char *out, size_t out_len)
     bool success;
     unsigned attempt;
     char host[ACCESSORY_HUE_HOST_MAX_LEN + 1];
+    char bridge_name[ACCESSORY_HUE_BRIDGE_NAME_MAX_LEN + 1] = "";
     char last_json[HUE_PAIR_RESPONSE_SIZE];
     if (hue_pair_lock != NULL) {
         xSemaphoreTake(hue_pair_lock, portMAX_DELAY);
@@ -546,6 +599,7 @@ esp_err_t hue_integration_pair_progress_json(char *out, size_t out_len)
         accessory_config_load_hue(&config);
         if (config.app_key[0] != '\0') {
             success = true;
+            strlcpy(bridge_name, config.bridge_name, sizeof(bridge_name));
             if (host[0] == '\0') {
                 strlcpy(host, config.bridge_host, sizeof(host));
             }
@@ -553,12 +607,15 @@ esp_err_t hue_integration_pair_progress_json(char *out, size_t out_len)
     }
 
     char escaped_host[96];
+    char escaped_name[96];
     json_escape(escaped_host, sizeof(escaped_host), host);
+    json_escape(escaped_name, sizeof(escaped_name), bridge_name);
     snprintf(out, out_len,
              "{\"type\":\"hue_pair_progress\",\"running\":%s,\"paired\":%s,"
-             "\"attempt\":%u,\"max_attempts\":%u,\"bridge_host\":\"%s\",\"last\":",
+             "\"attempt\":%u,\"max_attempts\":%u,\"bridge_host\":\"%s\","
+             "\"bridge_name\":\"%s\",\"last\":",
              running ? "true" : "false", success ? "true" : "false",
-             attempt, (unsigned)HUE_PAIR_WINDOW_ATTEMPTS, escaped_host);
+             attempt, (unsigned)HUE_PAIR_WINDOW_ATTEMPTS, escaped_host, escaped_name);
     append_json(out, out_len, "%s}", last_json[0] != '\0' ? last_json : "null");
     return ESP_OK;
 }
@@ -595,8 +652,11 @@ static esp_err_t hue_bridge_get_json(const char *path, const char *type,
         return err;
     }
 
-    snprintf(out, out_len, "{\"type\":\"%s\",\"bridge_host\":\"%s\",\"api\":\"v1\","
-             "\"data\":", type, config.bridge_host);
+    char bridge_name[96];
+    json_escape(bridge_name, sizeof(bridge_name), config.bridge_name);
+    snprintf(out, out_len, "{\"type\":\"%s\",\"bridge_host\":\"%s\","
+             "\"bridge_name\":\"%s\",\"api\":\"v1\",\"data\":",
+             type, config.bridge_host, bridge_name);
     append_json(out, out_len, "%s}", response[0] != '\0' ? response : "{}");
     free(response);
     return ESP_OK;

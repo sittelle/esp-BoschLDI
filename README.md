@@ -156,6 +156,7 @@ Read endpoints:
 - `GET /api/bike`: latest decoded bike state as JSON
 - `GET /api/logs`: runtime log ring as JSON
 - `GET /api/state`: bike state and runtime logs in one JSON response
+- `GET /api/automation/rules`: current bike-to-Hue automation rules
 - `GET /api/hue/bridges`: Hue Bridge discovery via mDNS
 - `GET /api/hue/status`: local Hue pairing status without exposing the stored app key
 - `GET /api/hue/pair/progress`: current background Hue pairing status
@@ -190,8 +191,19 @@ Configuration endpoints use `application/x-www-form-urlencoded` form bodies:
 - `POST /api/hue/pair/start`
   - `bridge_host`: optional bridge IP/host; starts a one-minute pairing window that retries automatically
 - `POST /api/hue/light/state`
+  - Internal automation action endpoint.
   - `light_id`: numeric Hue v1 light id from `/api/hue/devices`
   - `on`: `true`, `1`, or `on` switches on; any other value switches off
+- `POST /api/automation/rule`
+  - `enabled`: optional checkbox value
+  - `field`: decoded bike field such as `speed_kmh`, `bike_light`, or `bike_not_driving`
+  - `op`: `<`, `<=`, `==`, `>=`, or `>`
+  - `value`: numeric comparison value; boolean fields use `0` or `1`, bike light uses `1` for off and `2` for on
+  - `light_id`: numeric Hue v1 light id from `/api/hue/devices`
+  - `action_on`: `true`, `1`, or `on` turns on; any other value turns off
+  - `cooldown_sec`: clamped to 5-3600
+- `POST /api/automation/clear`
+  - Clears all stored automation rules
 - `POST /api/hue/clear`
   - Clears the locally stored Hue Bridge host and app key
 
@@ -219,7 +231,7 @@ Hue smart plugs are usually reached through a Hue Bridge on the LAN, not as dire
 GET /api/hue/bridges
 ```
 
-The Hue tab has discovery, pairing, and device loading actions. The response contains discovered bridge instance names, hostnames, IPv4 addresses, ports, and TXT metadata where available.
+The Hue tab is intentionally an overview and pairing surface, not a Hue management app. It discovers bridges, shows the paired bridge name when mDNS provides one, and lists reachable Hue devices in a table so automation targets are easy to identify.
 
 Pairing creates a local Hue application key. The preferred UI flow starts a one-minute pairing window:
 
@@ -249,14 +261,19 @@ GET /api/hue/resources
 POST /api/hue/light/state
 ```
 
-The first implementation uses the local Hue v1 HTTP API because it is reliable on ESP32 without adding Hue Bridge certificate handling. Smart plugs typically appear in the Hue `lights` resource as on/off controllable devices. The Hue tab can switch returned lamps and smart plugs on/off.
+The first implementation uses the local Hue v1 HTTP API because it is reliable on ESP32 without adding Hue Bridge certificate handling. Smart plugs typically appear in the Hue `lights` resource as on/off controllable devices. Direct on/off actions are kept in the automation flow, not the Hue overview tab.
+
+## Automation
+
+Automation rules are stored in NVS as a small JSON array, capped at six rules. Rules are evaluated only when fresh Bosch Live Data arrives from the bike. Each rule has a cooldown, so a matching condition cannot toggle the same Hue target continuously on every notification.
+
+The first rule engine supports numeric comparisons against decoded bike fields and Hue on/off actions. Supported fields currently include `speed_kmh`, `cadence_rpm`, `rider_power_w`, `ambient_brightness_lux`, `battery_soc`, `odometer_m`, `bike_light`, `system_locked`, `charger_connected`, `light_reserve_state`, `diagnosis_program_active`, and `bike_not_driving`.
 
 Next steps for plug control and automation:
 
 - Add multi-bridge pairing storage if controlling more than one Hue Bridge is needed.
-- Persist a small rule list with `enabled`, bike field, operator, value, Hue device id, on/off action, and cooldown.
-- Evaluate rules only when fresh bike data arrives, and ignore stale bike state.
-- Expose rule CRUD APIs and turn the Automation tab into an editor fed by `/api/bike` and `/api/hue/devices`.
+- Add delete/edit per rule instead of clear-all plus append.
+- Add richer condition types once more bike data fields are decoded.
 - Move resource listing/control to Hue API v2 HTTPS once certificate handling is implemented.
 
 ## Storage

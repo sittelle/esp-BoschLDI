@@ -14,6 +14,7 @@
 #define ACCESSORY_EXPORT_MAX_INTERVAL_SEC 3600
 #define ACCESSORY_HUE_HOST_MAX_LEN 63
 #define ACCESSORY_HUE_BRIDGE_ID_MAX_LEN 63
+#define ACCESSORY_HUE_BRIDGE_NAME_MAX_LEN 63
 #define ACCESSORY_HUE_APP_KEY_MAX_LEN 95
 #define ACCESSORY_LED_BRIGHTNESS_MIN 1
 #define ACCESSORY_LED_BRIGHTNESS_MAX 100
@@ -28,6 +29,7 @@ typedef struct {
 typedef struct {
     char bridge_host[ACCESSORY_HUE_HOST_MAX_LEN + 1];
     char bridge_id[ACCESSORY_HUE_BRIDGE_ID_MAX_LEN + 1];
+    char bridge_name[ACCESSORY_HUE_BRIDGE_NAME_MAX_LEN + 1];
     char app_key[ACCESSORY_HUE_APP_KEY_MAX_LEN + 1];
 } accessory_hue_config_t;
 

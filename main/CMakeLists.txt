@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "app_main.c"
         "accessory_config.c"
+        "automation.c"
         "ble_gap.c"
         "gatt_client.c"
         "hue_integration.c"

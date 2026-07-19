@@ -1,6 +1,7 @@
 #include "wifi_admin.h"
 
 #include "accessory_config.h"
+#include "automation.h"
 #include "ble_gap.h"
 #include "hue_integration.h"
 #include "live_data_decode.h"
@@ -44,6 +45,7 @@
 #define WIFI_ADMIN_HUE_RESPONSE_SIZE 2048
 #define WIFI_ADMIN_HUE_DEVICES_RESPONSE_SIZE 20000
 #define WIFI_ADMIN_HUE_RESOURCES_RESPONSE_SIZE 28000
+#define WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE 4096
 
 static const char *TAG = "wifi_admin";
 static const EventBits_t WIFI_CONNECTED_BIT = BIT0;
@@ -614,6 +616,93 @@ static esp_err_t api_state_get_handler(httpd_req_t *req)
     return httpd_resp_sendstr_chunk(req, NULL);
 }
 
+static esp_err_t api_automation_rules_get_handler(httpd_req_t *req)
+{
+    char *response = malloc(WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    if (response == NULL) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"automation response allocation failed\"}");
+    }
+
+    esp_err_t err = automation_rules_json(response, WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    httpd_resp_set_type(req, "application/json");
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+    }
+    err = httpd_resp_sendstr(req, response);
+    free(response);
+    return err;
+}
+
+static esp_err_t api_automation_rule_post_handler(httpd_req_t *req)
+{
+    char body[256] = {0};
+    if (req->content_len <= 0 || req->content_len >= (int)sizeof(body)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"Invalid form\"}");
+    }
+
+    int read_len = httpd_req_recv(req, body, req->content_len);
+    if (read_len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"Could not read form\"}");
+    }
+    body[read_len] = '\0';
+
+    automation_rule_t rule = {0};
+    char enabled[4];
+    char value[24];
+    char action_on[8];
+    char cooldown[12];
+    form_value(body, "enabled", enabled, sizeof(enabled));
+    form_value(body, "field", rule.field, sizeof(rule.field));
+    form_value(body, "op", rule.op, sizeof(rule.op));
+    form_value(body, "value", value, sizeof(value));
+    form_value(body, "light_id", rule.light_id, sizeof(rule.light_id));
+    form_value(body, "action_on", action_on, sizeof(action_on));
+    form_value(body, "cooldown_sec", cooldown, sizeof(cooldown));
+
+    rule.enabled = enabled[0] != '\0';
+    rule.value = strtod(value, NULL);
+    rule.action_on = strcmp(action_on, "1") == 0 ||
+                     strcmp(action_on, "true") == 0 ||
+                     strcmp(action_on, "on") == 0;
+    rule.cooldown_sec = (uint32_t)strtoul(cooldown, NULL, 10);
+
+    char *response = malloc(WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    if (response == NULL) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"automation response allocation failed\"}");
+    }
+
+    esp_err_t err = automation_add_rule(&rule, response, WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    httpd_resp_set_type(req, "application/json");
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+    }
+    err = httpd_resp_sendstr(req, response);
+    free(response);
+    return err;
+}
+
+static esp_err_t api_automation_clear_post_handler(httpd_req_t *req)
+{
+    char *response = malloc(WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    if (response == NULL) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"automation response allocation failed\"}");
+    }
+
+    esp_err_t err = automation_clear_rules(response, WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    httpd_resp_set_type(req, "application/json");
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+    }
+    err = httpd_resp_sendstr(req, response);
+    free(response);
+    return err;
+}
+
 static esp_err_t api_hue_bridges_get_handler(httpd_req_t *req)
 {
     char *response = malloc(WIFI_ADMIN_HUE_RESPONSE_SIZE);
@@ -856,6 +945,8 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         ".plan{background:#fff;border-left:4px solid #1769aa;padding:12px 14px;margin:10px 0 16px}"
         ".ledgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;max-width:780px}"
         ".ledgrid input[type=color]{height:38px;padding:2px}"
+        ".tablewrap{overflow:auto;background:#fff;border:1px solid #d8dde2;border-radius:6px;margin:10px 0 16px}"
+        "table{width:100%;border-collapse:collapse;min-width:760px}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #e6e9ec;font-size:14px}th{background:#f1f3f5;font-weight:700}"
         ".doc{max-width:900px}.doc p,.doc li{line-height:1.45}.doc code{background:#e9ecef;padding:1px 4px;border-radius:3px}"
         "pre{white-space:pre-wrap;background:#111;color:#e8e8e8;"
         "padding:14px;border-radius:6px;overflow:auto;font:13px/1.45 ui-monospace,Consolas,monospace}"
@@ -919,18 +1010,24 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<button onclick=clearHue()>Clear Pairing</button></div>"
         "<p class=hint>Click Pair Bridge, then press the physical Hue Bridge button. The ESP checks automatically for about one minute. Leave host empty to use the first discovered bridge.</p>"
         "<label>Bridge host</label><input id=hue_host placeholder='auto or bridge IP'>"
-        "<div id=hue_devices class=grid></div><pre id=hue_output>Hue Bridge discovery uses mDNS. Pairing stores a local Hue app key in NVS.</pre></section>"
+        "<div id=hue_devices class=tablewrap></div><pre id=hue_output>Hue Bridge discovery uses mDNS. Pairing stores a local Hue app key in NVS.</pre></section>"
         "<section id=automation class=tab><div class=label>Bike to Hue automation</div>"
-        "<div class=plan><strong>Next implementation step</strong><ol>"
-        "<li>Persist a small rule list in NVS or a rotated config file: enabled, bike field, operator, value, Hue light id, action on/off, cooldown.</li>"
-        "<li>Add Hue action endpoints for <code>PUT /api/{key}/lights/{id}/state</code> with <code>{\"on\":true}</code> or <code>{\"on\":false}</code>.</li>"
-        "<li>Evaluate rules only when fresh bike data arrives, with a cooldown to prevent rapid plug toggling.</li>"
-        "<li>Expose rule CRUD APIs and render this tab as an editor fed by <code>/api/bike</code> and <code>/api/hue/devices</code>.</li>"
-        "</ol></div>"
-        "<div class=grid><div class=device><h3>If</h3><div class=muted>Choose a decoded bike field such as speed, assist mode, battery, light state, or connection status.</div></div>"
-        "<div class=device><h3>Then</h3><div class=muted>Choose a Hue smart plug or lamp and turn it on or off.</div></div>"
-        "<div class=device><h3>Guard</h3><div class=muted>Use cooldown and stale-data checks before changing a device.</div></div></div>"
-        "<pre id=automation_preview>Pair a Hue Bridge to enable rule editing in a later build.</pre></section>"
+        "<form class=wifi onsubmit='return addAutomationRule(event)'>"
+        "<label><input id=auto_enabled name=enabled type=checkbox checked>Enabled</label>"
+        "<label>If bike field</label><select id=auto_field name=field>"
+        "<option value=speed_kmh>Speed km/h</option><option value=cadence_rpm>Cadence rpm</option>"
+        "<option value=rider_power_w>Rider power W</option><option value=ambient_brightness_lux>Ambient brightness lux</option>"
+        "<option value=battery_soc>Battery %</option><option value=odometer_m>Odometer m</option>"
+        "<option value=bike_light>Bike light: off=1, on=2</option><option value=system_locked>System locked</option>"
+        "<option value=charger_connected>Charger connected</option><option value=light_reserve_state>Light reserve</option>"
+        "<option value=diagnosis_program_active>Diagnosis active</option><option value=bike_not_driving>Bike not driving</option>"
+        "</select><label>Operator</label><select id=auto_op name=op><option>&lt;</option><option>&lt;=</option><option>==</option><option>&gt;=</option><option>&gt;</option></select>"
+        "<label>Value</label><input id=auto_value name=value type=number step=0.001 value=1>"
+        "<label>Hue device</label><select id=auto_light_id name=light_id><option value=''>Load Hue devices first</option></select>"
+        "<label>Action</label><select id=auto_action_on name=action_on><option value=true>Turn on</option><option value=false>Turn off</option></select>"
+        "<label>Cooldown seconds</label><input id=auto_cooldown_sec name=cooldown_sec type=number min=5 max=3600 value=30>"
+        "<button type=submit>Add rule</button></form><button onclick=clearAutomationRules()>Clear rules</button>"
+        "<div id=automation_rules class=grid></div><pre id=automation_preview>Rules run only when fresh bike data arrives.</pre></section>"
         "<section id=docs class='tab doc'><div class=label>How it works</div>"
         "<p>This ESP32 advertises itself over BLE as a Bosch Live Data accessory. After the bike pairs, the ESP subscribes to Live Data notifications, decodes known fields, keeps the latest state in RAM, and writes a small rotated persistent bike log to flash.</p>"
         "<p>The web UI is served by the ESP over Wi-Fi. The network hostname stays <code>boschldi.local</code>. If saved Wi-Fi is unavailable, the setup access point starts and the setup page is available at <code>192.168.4.1</code>.</p>"
@@ -938,26 +1035,29 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<li><code>GET /api/bike</code> latest decoded bike state as JSON.</li>"
         "<li><code>GET /api/logs</code> runtime log ring as JSON.</li>"
         "<li><code>GET /api/state</code> bike state and runtime logs in one JSON response.</li>"
+        "<li><code>GET /api/automation/rules</code> current bike-to-Hue rules.</li>"
         "<li><code>GET /api/hue/bridges</code> discover Hue Bridges on the LAN with mDNS.</li>"
         "<li><code>GET /api/hue/status</code> local Hue pairing status without exposing the app key.</li>"
         "<li><code>POST /api/hue/pair</code> optional form field <code>bridge_host</code>. Press the Bridge button first.</li>"
         "<li><code>POST /api/hue/pair/start</code> starts a one-minute background pairing window.</li>"
         "<li><code>GET /api/hue/pair/progress</code> current background pairing status.</li>"
         "<li><code>GET /api/hue/devices</code> Hue v1 <code>lights</code> resource, including lamps and smart plugs exposed as controllable lights.</li>"
-        "<li><code>POST /api/hue/light/state</code> form fields <code>light_id</code> and <code>on</code>; switches one Hue light or plug on/off.</li>"
+        "<li><code>POST /api/hue/light/state</code> form fields <code>light_id</code> and <code>on</code>; internal automation action endpoint.</li>"
         "<li><code>GET /api/hue/resources</code> full Hue v1 bridge state for debugging.</li>"
-        "<li><code>GET /config</code> current device name and push export settings.</li>"
+        "<li><code>GET /config</code> current device name, push export, LED, and Wi-Fi settings.</li>"
         "<li><code>GET /scan</code> nearby Wi-Fi networks.</li>"
         "<li><code>GET /bike-log</code> current rotated persistent bike log.</li>"
         "<li><code>GET /bike-log/previous</code> previous rotated persistent bike log.</li></ul>"
         "<div class=label>Configuration APIs</div><ul>"
         "<li><code>POST /device-name</code> form field <code>device_name</code>. Changes the BLE accessory name shown to the bike, not DNS.</li>"
         "<li><code>POST /save</code> form fields <code>ssid</code> and <code>pass</code>. Tries the new Wi-Fi without reboot, saves only after success, and falls back to the previous saved Wi-Fi on failure.</li>"
-        "<li><code>POST /export-config</code> form fields <code>logs_url</code>, <code>logs_interval_sec</code>, <code>bike_url</code>, <code>bike_interval_sec</code>. Empty URLs disable push export.</li></ul>"
+        "<li><code>POST /export-config</code> form fields <code>logs_url</code>, <code>logs_interval_sec</code>, <code>bike_url</code>, <code>bike_interval_sec</code>. Empty URLs disable push export.</li>"
+        "<li><code>POST /api/automation/rule</code> form fields <code>enabled</code>, <code>field</code>, <code>op</code>, <code>value</code>, <code>light_id</code>, <code>action_on</code>, <code>cooldown_sec</code>.</li>"
+        "<li><code>POST /api/automation/clear</code> removes all automation rules.</li></ul>"
         "<div class=label>Polling</div><p>Clients can poll <code>/api/bike</code> every 1-2 seconds. Poll <code>/api/logs</code> only while a user is watching logs. Push export remains optional and bounded by firmware interval limits.</p>"
         "</section></main>"
         "<script>let rawLogs='';let huePaired=false;function showTab(id){document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.id==id));"
-        "document.querySelectorAll('.tabbtn').forEach(x=>x.classList.toggle('active',x.dataset.tab==id));if(id=='logs')renderLogs();if(id=='config')loadConfig();if(id=='hue'){loadHueStatus();if(huePaired)loadHueDevices()}if(id=='automation')loadAutomationPreview()}"
+        "document.querySelectorAll('.tabbtn').forEach(x=>x.classList.toggle('active',x.dataset.tab==id));if(id=='logs')renderLogs();if(id=='config')loadConfig();if(id=='hue'){loadHueStatus();if(huePaired)loadHueDevices()}if(id=='automation')loadAutomation()}"
         "function logLevel(x){let m=x.match(/^[EWIDV]\\s*\\(/);if(m)return m[0][0];"
         "m=x.match(/\\b(error|warn|info|debug)\\b/i);return m?m[1][0].toUpperCase():''}"
         "function logTag(x){let m=x.match(/^[EWIDV]\\s*\\([^)]*\\)\\s+([^:]+):/);return m?m[1].toLowerCase():x.toLowerCase()}"
@@ -994,26 +1094,25 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "['boot','advertising','connected','secured','ready','activity','error'].forEach(k=>{let v=c['led_'+k+'_color'];if(v)document.getElementById('led_'+k+'_color').value=v})}catch(e){}}"
         "async function loadHueStatus(){try{let r=await fetch('/api/hue/status',{cache:'no-store'});let j=await r.json();huePaired=!!j.paired;"
         "document.getElementById('automation_tab_btn').style.display=huePaired?'block':'none';"
-        "document.getElementById('hue_status').textContent=huePaired?'Connected to Hue Bridge: '+j.bridge_host:'Hue Bridge is not paired.';"
+        "document.getElementById('hue_status').textContent=huePaired?'Connected to Hue Bridge: '+bridgeLabel(j):'Hue Bridge is not paired.';"
         "if(j.bridge_host)document.getElementById('hue_host').value=j.bridge_host}catch(e){document.getElementById('hue_status').textContent='Could not load Hue status'}}"
-        "function hueDeviceHtml(id,d){let reachable=!d.state||d.state.reachable!==false,on=!!(d.state&&d.state.on),plug=(d.type||'').toLowerCase().includes('plug')||(d.productname||'').toLowerCase().includes('plug');"
+        "function bridgeLabel(j){let n=j.bridge_name||j.instance||'';let h=j.bridge_host||j.ip||j.hostname||'';return n?(n+(h?' ('+h+')':'')):(h||'unknown')}"
+        "function hueDeviceRow(id,d){let reachable=!d.state||d.state.reachable!==false,on=!!(d.state&&d.state.on),plug=(d.type||'').toLowerCase().includes('plug')||(d.productname||'').toLowerCase().includes('plug');"
         "let state=reachable?(on?'On':'Off'):'Unreachable',cls=reachable?(on?'on':'off'):'warn',kind=plug?'Smart plug':(d.productname||d.type||'Light');"
         "let bri=d.state&&d.state.bri!=null?Math.round(d.state.bri/254*100)+'%':'-';"
-        "return '<div class=device><div class=row><h3>'+escapeHtml(d.name||('Device '+id))+'</h3><span class=\"badge '+cls+'\">'+state+'</span></div>'"
-        "+'<div><button onclick=\"setHueLight(\\''+escapeHtml(id)+'\\',true)\">On</button><button onclick=\"setHueLight(\\''+escapeHtml(id)+'\\',false)\">Off</button></div>'"
-        "+'<div class=row><span class=muted>Kind</span><strong>'+escapeHtml(kind)+'</strong></div>'"
-        "+'<div class=row><span class=muted>Hue id</span><code>'+escapeHtml(id)+'</code></div>'"
-        "+'<div class=row><span class=muted>Type</span><span>'+escapeHtml(d.type||'-')+'</span></div>'"
-        "+'<div class=row><span class=muted>Brightness</span><span>'+bri+'</span></div>'"
-        "+'<div class=row><span class=muted>Model</span><span>'+escapeHtml(d.modelid||'-')+'</span></div></div>'}"
+        "return '<tr><td><strong>'+escapeHtml(d.name||('Device '+id))+'</strong></td><td><span class=\"badge '+cls+'\">'+state+'</span></td>'"
+        "+'<td>'+escapeHtml(kind)+'</td><td><code>'+escapeHtml(id)+'</code></td><td>'+escapeHtml(d.type||'-')+'</td><td>'+bri+'</td><td>'+escapeHtml(d.modelid||'-')+'</td></tr>'}"
         "function escapeHtml(s){let e=document.createElement('div');e.textContent=String(s);return e.innerHTML}"
         "function isPlug(d){return (d.type||'').toLowerCase().includes('plug')||(d.productname||'').toLowerCase().includes('plug')}"
         "function renderHueDevices(j){let box=document.getElementById('hue_devices'),data=j.data||{},ids=Object.keys(data).sort((a,b)=>isPlug(data[b])-isPlug(data[a])||String(data[a].name||a).localeCompare(String(data[b].name||b)));"
-        "box.innerHTML=ids.length?ids.map(id=>hueDeviceHtml(id,data[id])).join(''):'<div class=device>No Hue devices returned by the Bridge.</div>';}"
+        "box.innerHTML=ids.length?'<table><thead><tr><th>Name</th><th>State</th><th>Kind</th><th>Hue id</th><th>Type</th><th>Brightness</th><th>Model</th></tr></thead><tbody>'+ids.map(id=>hueDeviceRow(id,data[id])).join('')+'</tbody></table>':'<div class=device>No Hue devices returned by the Bridge.</div>';renderAutomationDeviceOptions(data)}"
+        "function renderAutomationDeviceOptions(data){let s=document.getElementById('auto_light_id');if(!s)return;let ids=Object.keys(data||{}).sort((a,b)=>isPlug(data[b])-isPlug(data[a])||String(data[a].name||a).localeCompare(String(data[b].name||b)));"
+        "s.innerHTML=ids.length?'':'<option value=\"\">No Hue devices loaded</option>';ids.forEach(id=>{let o=document.createElement('option');o.value=id;o.textContent=(data[id].name||('Device '+id))+' (#'+id+')';s.appendChild(o)})}"
         "async function discoverHue(){let h=document.getElementById('hue_output');h.textContent='Scanning...';"
         "try{let r=await fetch('/api/hue/bridges',{cache:'no-store'});let j=await r.json();"
-        "if(j.bridges&&j.bridges[0])document.getElementById('hue_host').value=j.bridges[0].ip||j.bridges[0].hostname||'';"
-        "h.textContent=JSON.stringify(j,null,2)}catch(e){h.textContent='Hue discovery failed'}}"
+        "if(j.bridges&&j.bridges[0]){document.getElementById('hue_host').value=j.bridges[0].ip||j.bridges[0].hostname||'';"
+        "h.textContent='Found '+bridgeLabel(j.bridges[0])+'\\n\\n'+JSON.stringify(j,null,2)}else h.textContent='No Hue Bridge discovered.'}"
+        "catch(e){h.textContent='Hue discovery failed'}}"
         "let huePairTimer=null;"
         "async function pollHuePair(){let h=document.getElementById('hue_output');try{let r=await fetch('/api/hue/pair/progress',{cache:'no-store'});"
         "let j=await r.json();h.textContent=JSON.stringify(j,null,2);if(j.paired){huePaired=true;loadHueStatus();loadHueDevices()}if(!j.running&&huePairTimer){clearInterval(huePairTimer);huePairTimer=null}}"
@@ -1024,12 +1123,19 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "if(huePairTimer)clearInterval(huePairTimer);huePairTimer=setInterval(pollHuePair,2000);setTimeout(pollHuePair,600)}"
         "catch(e){h.textContent='Hue pairing start failed'}}"
         "async function loadHueDevices(){let h=document.getElementById('hue_output');h.textContent='Loading Hue devices...';"
-        "try{let r=await fetch('/api/hue/devices',{cache:'no-store'});let j=await r.json();renderHueDevices(j);h.textContent='Loaded '+Object.keys(j.data||{}).length+' Hue devices.'}"
+        "try{let r=await fetch('/api/hue/devices',{cache:'no-store'});let j=await r.json();renderHueDevices(j);h.textContent='Loaded '+Object.keys(j.data||{}).length+' Hue devices from '+bridgeLabel(j)+'.'}"
         "catch(e){h.textContent='Hue device load failed'}}"
-        "async function setHueLight(id,on){let h=document.getElementById('hue_output');h.textContent='Sending Hue command...';"
-        "let b=new URLSearchParams();b.set('light_id',id);b.set('on',on?'true':'false');try{let r=await fetch('/api/hue/light/state',{method:'POST',body:b});"
-        "let j=await r.json();h.textContent=JSON.stringify(j,null,2);setTimeout(loadHueDevices,500)}catch(e){h.textContent='Hue command failed'}}"
-        "function loadAutomationPreview(){document.getElementById('automation_preview').textContent=huePaired?'Rule editor planned: bike condition -> Hue device on/off action.':'Pair a Hue Bridge first.'}"
+        "function ruleHtml(r,i){return '<div class=device><div class=row><h3>Rule '+(i+1)+'</h3><span class=\"badge '+(r.enabled?'on':'off')+'\">'+(r.enabled?'Enabled':'Off')+'</span></div>'"
+        "+'<div>If <strong>'+escapeHtml(r.field)+'</strong> '+escapeHtml(r.op)+' '+Number(r.value).toFixed(3)+'</div>'"
+        "+'<div>Then Hue #'+escapeHtml(r.light_id)+' '+(r.action_on?'on':'off')+'</div><div class=muted>Cooldown '+r.cooldown_sec+'s</div></div>'}"
+        "async function loadAutomation(){if(huePaired)loadHueDevices();let p=document.getElementById('automation_preview'),box=document.getElementById('automation_rules');"
+        "try{let r=await fetch('/api/automation/rules',{cache:'no-store'});let j=await r.json();box.innerHTML=(j.rules||[]).length?j.rules.map(ruleHtml).join(''):'<div class=device>No automation rules yet.</div>';p.textContent='Rules run when new bike data arrives. Boolean fields use 0=false and 1=true.'}"
+        "catch(e){p.textContent='Could not load automation rules'}}"
+        "async function addAutomationRule(ev){ev.preventDefault();let p=document.getElementById('automation_preview'),b=new URLSearchParams();"
+        "['field','op','value','light_id','cooldown_sec'].forEach(k=>b.set(k,document.getElementById('auto_'+k).value));"
+        "b.set('enabled',document.getElementById('auto_enabled').checked?'1':'');b.set('action_on',document.getElementById('auto_action_on').value);"
+        "try{let r=await fetch('/api/automation/rule',{method:'POST',body:b});let j=await r.json();p.textContent=JSON.stringify(j,null,2);loadAutomation()}catch(e){p.textContent='Rule save failed'}return false}"
+        "async function clearAutomationRules(){let p=document.getElementById('automation_preview');try{let r=await fetch('/api/automation/clear',{method:'POST'});let j=await r.json();p.textContent=JSON.stringify(j,null,2);loadAutomation()}catch(e){p.textContent='Rule clear failed'}}"
         "async function clearHue(){let h=document.getElementById('hue_output');h.textContent='Clearing Hue pairing...';"
         "try{let r=await fetch('/api/hue/clear',{method:'POST'});let j=await r.json();h.textContent=JSON.stringify(j,null,2);huePaired=false;document.getElementById('automation_tab_btn').style.display='none';document.getElementById('hue_devices').innerHTML=''}"
         "catch(e){h.textContent='Hue pairing clear failed'}}"
@@ -1309,7 +1415,7 @@ static esp_err_t start_http_server(bool setup_mode)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.stack_size = 8192;
-    config.max_uri_handlers = 30;
+    config.max_uri_handlers = 34;
     config.uri_match_fn = httpd_uri_match_wildcard;
 
     ESP_RETURN_ON_ERROR(httpd_start(&http_server, &config), TAG, "HTTP start failed");
@@ -1362,6 +1468,27 @@ static esp_err_t start_http_server(bool setup_mode)
         .handler = api_state_get_handler,
     };
     httpd_register_uri_handler(http_server, &api_state);
+
+    const httpd_uri_t api_automation_rules = {
+        .uri = "/api/automation/rules",
+        .method = HTTP_GET,
+        .handler = api_automation_rules_get_handler,
+    };
+    httpd_register_uri_handler(http_server, &api_automation_rules);
+
+    const httpd_uri_t api_automation_rule = {
+        .uri = "/api/automation/rule",
+        .method = HTTP_POST,
+        .handler = api_automation_rule_post_handler,
+    };
+    httpd_register_uri_handler(http_server, &api_automation_rule);
+
+    const httpd_uri_t api_automation_clear = {
+        .uri = "/api/automation/clear",
+        .method = HTTP_POST,
+        .handler = api_automation_clear_post_handler,
+    };
+    httpd_register_uri_handler(http_server, &api_automation_clear);
 
     const httpd_uri_t api_hue_bridges = {
         .uri = "/api/hue/bridges",

@@ -12,6 +12,7 @@
 #define ACCESSORY_CONFIG_BIKE_INTERVAL_KEY "bike_sec"
 #define ACCESSORY_CONFIG_HUE_HOST_KEY "hue_host"
 #define ACCESSORY_CONFIG_HUE_BRIDGE_ID_KEY "hue_bridge"
+#define ACCESSORY_CONFIG_HUE_BRIDGE_NAME_KEY "hue_name"
 #define ACCESSORY_CONFIG_HUE_APP_KEY_KEY "hue_key"
 #define ACCESSORY_CONFIG_LED_ENABLED_KEY "led_enabled"
 #define ACCESSORY_CONFIG_LED_BRIGHTNESS_KEY "led_bright"
@@ -81,6 +82,25 @@ static bool config_ascii_token_is_valid(const char *value, size_t max_len, bool 
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)value[i];
         if (c < 0x21 || c > 0x7e) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool config_printable_ascii_is_valid(const char *value, size_t max_len, bool allow_empty)
+{
+    if (value == NULL) {
+        return false;
+    }
+
+    size_t len = strlen(value);
+    if ((!allow_empty && len == 0) || len > max_len) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (c < 0x20 || c > 0x7e) {
             return false;
         }
     }
@@ -362,6 +382,8 @@ esp_err_t accessory_config_load_hue(accessory_hue_config_t *out)
                         out->bridge_host, sizeof(out->bridge_host));
     nvs_get_str_default(nvs, ACCESSORY_CONFIG_HUE_BRIDGE_ID_KEY,
                         out->bridge_id, sizeof(out->bridge_id));
+    nvs_get_str_default(nvs, ACCESSORY_CONFIG_HUE_BRIDGE_NAME_KEY,
+                        out->bridge_name, sizeof(out->bridge_name));
     nvs_get_str_default(nvs, ACCESSORY_CONFIG_HUE_APP_KEY_KEY,
                         out->app_key, sizeof(out->app_key));
     nvs_close(nvs);
@@ -371,6 +393,10 @@ esp_err_t accessory_config_load_hue(accessory_hue_config_t *out)
     }
     if (!config_ascii_token_is_valid(out->bridge_id, ACCESSORY_HUE_BRIDGE_ID_MAX_LEN, true)) {
         out->bridge_id[0] = '\0';
+    }
+    if (!config_printable_ascii_is_valid(out->bridge_name,
+                                         ACCESSORY_HUE_BRIDGE_NAME_MAX_LEN, true)) {
+        out->bridge_name[0] = '\0';
     }
     if (!config_ascii_token_is_valid(out->app_key, ACCESSORY_HUE_APP_KEY_MAX_LEN, true)) {
         out->app_key[0] = '\0';
@@ -383,6 +409,8 @@ esp_err_t accessory_config_save_hue(const accessory_hue_config_t *config)
     if (config == NULL ||
         !config_ascii_token_is_valid(config->bridge_host, ACCESSORY_HUE_HOST_MAX_LEN, false) ||
         !config_ascii_token_is_valid(config->bridge_id, ACCESSORY_HUE_BRIDGE_ID_MAX_LEN, true) ||
+        !config_printable_ascii_is_valid(config->bridge_name,
+                                         ACCESSORY_HUE_BRIDGE_NAME_MAX_LEN, true) ||
         !config_ascii_token_is_valid(config->app_key, ACCESSORY_HUE_APP_KEY_MAX_LEN, false)) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -396,6 +424,9 @@ esp_err_t accessory_config_save_hue(const accessory_hue_config_t *config)
     err = nvs_set_str(nvs, ACCESSORY_CONFIG_HUE_HOST_KEY, config->bridge_host);
     if (err == ESP_OK) {
         err = nvs_set_str(nvs, ACCESSORY_CONFIG_HUE_BRIDGE_ID_KEY, config->bridge_id);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, ACCESSORY_CONFIG_HUE_BRIDGE_NAME_KEY, config->bridge_name);
     }
     if (err == ESP_OK) {
         err = nvs_set_str(nvs, ACCESSORY_CONFIG_HUE_APP_KEY_KEY, config->app_key);
@@ -417,9 +448,11 @@ esp_err_t accessory_config_clear_hue(void)
 
     esp_err_t err_host = nvs_erase_key(nvs, ACCESSORY_CONFIG_HUE_HOST_KEY);
     esp_err_t err_bridge = nvs_erase_key(nvs, ACCESSORY_CONFIG_HUE_BRIDGE_ID_KEY);
+    esp_err_t err_name = nvs_erase_key(nvs, ACCESSORY_CONFIG_HUE_BRIDGE_NAME_KEY);
     esp_err_t err_key = nvs_erase_key(nvs, ACCESSORY_CONFIG_HUE_APP_KEY_KEY);
     if ((err_host == ESP_OK || err_host == ESP_ERR_NVS_NOT_FOUND) &&
         (err_bridge == ESP_OK || err_bridge == ESP_ERR_NVS_NOT_FOUND) &&
+        (err_name == ESP_OK || err_name == ESP_ERR_NVS_NOT_FOUND) &&
         (err_key == ESP_OK || err_key == ESP_ERR_NVS_NOT_FOUND)) {
         err = nvs_commit(nvs);
     } else {

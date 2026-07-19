@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "automation.h"
 #include "esp_log.h"
 #include "persistent_log.h"
 
@@ -348,6 +349,64 @@ bool live_data_latest_json(char *out, size_t out_len)
     return has_any;
 }
 
+bool live_data_latest_field_value(const char *field, double *out)
+{
+    if (field == NULL || out == NULL) {
+        return false;
+    }
+
+    live_data_t data = latest_state;
+    if (strcmp(field, "speed_kmh") == 0 && data.has_speed) {
+        *out = data.speed / 100.0;
+        return true;
+    }
+    if (strcmp(field, "cadence_rpm") == 0 && data.has_cadence) {
+        *out = data.cadence;
+        return true;
+    }
+    if (strcmp(field, "rider_power_w") == 0 && data.has_rider_power) {
+        *out = data.rider_power;
+        return true;
+    }
+    if (strcmp(field, "ambient_brightness_lux") == 0 && data.has_ambient_brightness) {
+        *out = data.ambient_brightness / 1000.0;
+        return true;
+    }
+    if (strcmp(field, "battery_soc") == 0 && data.has_battery_soc) {
+        *out = data.battery_soc;
+        return true;
+    }
+    if (strcmp(field, "odometer_m") == 0 && data.has_odometer) {
+        *out = data.odometer;
+        return true;
+    }
+    if (strcmp(field, "bike_light") == 0 && data.has_bike_light) {
+        *out = data.bike_light;
+        return true;
+    }
+    if (strcmp(field, "system_locked") == 0 && data.has_system_locked) {
+        *out = data.system_locked ? 1.0 : 0.0;
+        return true;
+    }
+    if (strcmp(field, "charger_connected") == 0 && data.has_charger_connected) {
+        *out = data.charger_connected ? 1.0 : 0.0;
+        return true;
+    }
+    if (strcmp(field, "light_reserve_state") == 0 && data.has_light_reserve_state) {
+        *out = data.light_reserve_state ? 1.0 : 0.0;
+        return true;
+    }
+    if (strcmp(field, "diagnosis_program_active") == 0 && data.has_diagnosis_program_active) {
+        *out = data.diagnosis_program_active ? 1.0 : 0.0;
+        return true;
+    }
+    if (strcmp(field, "bike_not_driving") == 0 && data.has_bike_not_driving) {
+        *out = data.bike_not_driving ? 1.0 : 0.0;
+        return true;
+    }
+    return false;
+}
+
 bool live_data_decode_and_log(const uint8_t *buf, size_t len)
 {
     live_data_t data = {0};
@@ -434,5 +493,6 @@ bool live_data_decode_and_log(const uint8_t *buf, size_t len)
     log_live_data(&data);
     merge_latest_state(&data);
     persist_live_data_sample(&latest_state);
+    automation_evaluate_latest();
     return true;
 }
