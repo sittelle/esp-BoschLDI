@@ -269,6 +269,8 @@ Automation rules are stored in NVS as a small JSON array, capped at six rules. R
 
 The first rule engine supports numeric comparisons against decoded bike fields and Hue on/off actions. Supported fields currently include `speed_kmh`, `cadence_rpm`, `rider_power_w`, `ambient_brightness_lux`, `battery_soc`, `odometer_m`, `bike_light`, `system_locked`, `charger_connected`, `light_reserve_state`, `diagnosis_program_active`, and `bike_not_driving`.
 
+Automation runs in its own FreeRTOS worker task. Live Data decoding only queues a lightweight evaluation request, so BLE packet handling is not blocked by JSON parsing or network I/O. If station Wi-Fi is not connected, automation actions are skipped because Hue devices cannot be reached.
+
 Next steps for plug control and automation:
 
 - Add multi-bridge pairing storage if controlling more than one Hue Bridge is needed.
@@ -285,7 +287,7 @@ Partition layout:
 - App partition: 4 MB
 - SPIFFS storage: 256 KB
 
-SPIFFS stores persistent bike/connection logs. The firmware keeps a current file and one previous rotated file. Runtime logs shown in the UI are primarily from an in-memory ring buffer, not flash.
+SPIFFS stores persistent bike/connection logs. The firmware keeps a current file and one previous rotated file. Runtime logs shown in the UI are primarily from an in-memory ring buffer, not flash. Optional JSON push export for runtime logs and bike data is skipped while station Wi-Fi is disconnected.
 
 Generated firmware binaries, build output, managed components, runtime logs, and local/private files are ignored by git.
 

@@ -15,6 +15,7 @@
 #include "live_data_decode.h"
 #include "log_store.h"
 #include "persistent_log.h"
+#include "wifi_admin.h"
 
 #define EXPORT_POLL_INTERVAL_MS 5000
 #define EXPORT_LOG_BUFFER_SIZE 8192
@@ -136,6 +137,11 @@ static void telemetry_export_task(void *arg)
         accessory_config_load_device_name(device_name, sizeof(device_name));
 
         int64_t now = esp_timer_get_time();
+        if (!wifi_admin_is_connected()) {
+            vTaskDelay(pdMS_TO_TICKS(EXPORT_POLL_INTERVAL_MS));
+            continue;
+        }
+
         if (config.logs_url[0] != '\0' &&
             (last_logs_us == 0 ||
              now - last_logs_us >= (int64_t)config.logs_interval_sec * 1000000LL)) {

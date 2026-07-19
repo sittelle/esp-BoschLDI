@@ -1761,3 +1761,8 @@ esp_err_t wifi_admin_start(void)
     start_setup_ap();
     return ESP_OK;
 }
+
+bool wifi_admin_is_connected(void)
+{
+    return current_ssid[0] != '\0';
+}

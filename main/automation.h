@@ -26,4 +26,5 @@ typedef struct {
 esp_err_t automation_rules_json(char *out, size_t out_len);
 esp_err_t automation_add_rule(const automation_rule_t *rule, char *out, size_t out_len);
 esp_err_t automation_clear_rules(char *out, size_t out_len);
-void automation_evaluate_latest(void);
+esp_err_t automation_start(void);
+void automation_request_evaluate(void);

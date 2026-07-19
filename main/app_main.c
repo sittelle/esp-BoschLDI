@@ -1,3 +1,4 @@
+#include "automation.h"
 #include "ble_gap.h"
 #include "log_store.h"
 #include "persistent_log.h"
@@ -106,6 +107,11 @@ void app_main(void)
     err = telemetry_export_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "telemetry exporter init failed; err=%s", esp_err_to_name(err));
+    }
+
+    err = automation_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "automation worker init failed; err=%s", esp_err_to_name(err));
     }
 
     ESP_ERROR_CHECK(nimble_port_init());

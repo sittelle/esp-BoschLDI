@@ -493,6 +493,6 @@ bool live_data_decode_and_log(const uint8_t *buf, size_t len)
     log_live_data(&data);
     merge_latest_state(&data);
     persist_live_data_sample(&latest_state);
-    automation_evaluate_latest();
+    automation_request_evaluate();
     return true;
 }

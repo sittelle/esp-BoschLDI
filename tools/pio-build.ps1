@@ -16,6 +16,14 @@ $idfPath = Join-Path $env:USERPROFILE ".platformio\packages\framework-espidf"
 if (Test-Path $idfPath) {
     $env:IDF_PATH = $idfPath
 }
+$toolEsptool = Join-Path $env:USERPROFILE ".platformio\packages\tool-esptoolpy"
+if (Test-Path $toolEsptool) {
+    if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) {
+        $env:PYTHONPATH = $toolEsptool
+    } elseif (!$env:PYTHONPATH.Split([System.IO.Path]::PathSeparator).Contains($toolEsptool)) {
+        $env:PYTHONPATH = "$toolEsptool$([System.IO.Path]::PathSeparator)$env:PYTHONPATH"
+    }
+}
 
 $buildDir = Join-Path $root ".pio\build\$Environment"
 if ($Clean -and (Test-Path $buildDir)) {

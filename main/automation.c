@@ -8,17 +8,24 @@
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "hue_integration.h"
 #include "live_data_decode.h"
 #include "nvs.h"
 #include "persistent_log.h"
+#include "wifi_admin.h"
 
 #define AUTOMATION_NAMESPACE "automation"
 #define AUTOMATION_RULES_KEY "rules"
 #define AUTOMATION_RULES_JSON_MAX_LEN 2048
+#define AUTOMATION_WORKER_STACK_WORDS 8192
 
 static const char *TAG = "automation";
 static int64_t last_fire_ms[AUTOMATION_MAX_RULES];
+static QueueHandle_t automation_queue;
+static bool automation_started;
 
 static bool ascii_token_valid(const char *value, size_t max_len)
 {
@@ -266,8 +273,13 @@ esp_err_t automation_clear_rules(char *out, size_t out_len)
     return err;
 }
 
-void automation_evaluate_latest(void)
+static void automation_evaluate_latest(void)
 {
+    if (!wifi_admin_is_connected()) {
+        ESP_LOGD(TAG, "Wi-Fi not connected; skipping automation evaluation");
+        return;
+    }
+
     char rules_text[AUTOMATION_RULES_JSON_MAX_LEN];
     if (load_rules_text(rules_text, sizeof(rules_text)) != ESP_OK) {
         return;
@@ -314,4 +326,50 @@ void automation_evaluate_latest(void)
         }
     }
     cJSON_Delete(root);
+}
+
+static void automation_worker_task(void *arg)
+{
+    (void)arg;
+    uint8_t request;
+
+    while (true) {
+        if (xQueueReceive(automation_queue, &request, portMAX_DELAY) == pdTRUE) {
+            automation_evaluate_latest();
+        }
+    }
+}
+
+esp_err_t automation_start(void)
+{
+    if (automation_started) {
+        return ESP_OK;
+    }
+
+    automation_queue = xQueueCreate(1, sizeof(uint8_t));
+    if (automation_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    BaseType_t ok = xTaskCreate(automation_worker_task, "automation",
+                                AUTOMATION_WORKER_STACK_WORDS, NULL, 3, NULL);
+    if (ok != pdPASS) {
+        vQueueDelete(automation_queue);
+        automation_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    automation_started = true;
+    persistent_log_event("info", "automation", "automation worker started");
+    return ESP_OK;
+}
+
+void automation_request_evaluate(void)
+{
+    if (automation_queue == NULL) {
+        return;
+    }
+
+    uint8_t request = 1;
+    xQueueOverwrite(automation_queue, &request);
 }
