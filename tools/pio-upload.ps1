@@ -4,7 +4,8 @@ param(
     [switch]$Clean,
     [switch]$Configure,
     [switch]$SkipBuild,
-    [switch]$AppOnly
+    [switch]$AppOnly,
+    [int]$Baud = 460800
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +27,14 @@ if (Test-Path $toolEsptool) {
         $env:PYTHONPATH = $toolEsptool
     } elseif (!$env:PYTHONPATH.Split([System.IO.Path]::PathSeparator).Contains($toolEsptool)) {
         $env:PYTHONPATH = "$toolEsptool$([System.IO.Path]::PathSeparator)$env:PYTHONPATH"
+    }
+}
+$pioPenvSitePackages = Join-Path $env:USERPROFILE ".platformio\penv\Lib\site-packages"
+if (Test-Path $pioPenvSitePackages) {
+    if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) {
+        $env:PYTHONPATH = $pioPenvSitePackages
+    } elseif (!$env:PYTHONPATH.Split([System.IO.Path]::PathSeparator).Contains($pioPenvSitePackages)) {
+        $env:PYTHONPATH = "$pioPenvSitePackages$([System.IO.Path]::PathSeparator)$env:PYTHONPATH"
     }
 }
 
@@ -58,12 +67,12 @@ if (!(Test-Path $pioPython)) {
 }
 
 if ($AppOnly) {
-    & $pioPython -m esptool --chip esp32s3 --port $Port --baud 921600 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB `
+    & $pioPython -m esptool --chip esp32s3 --port $Port --baud $Baud --before default-reset --after watchdog-reset write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB `
         0x10000 ".pio\build\$Environment\bosch_ldi_accessory.bin"
     exit $LASTEXITCODE
 }
 
-& $pioPython -m esptool --chip esp32s3 --port $Port --baud 921600 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB `
+& $pioPython -m esptool --chip esp32s3 --port $Port --baud $Baud --before default-reset --after watchdog-reset write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB `
     0x0 ".pio\build\$Environment\bootloader\bootloader.bin" `
     0x8000 ".pio\build\$Environment\partition_table\partition-table.bin" `
     0x10000 ".pio\build\$Environment\bosch_ldi_accessory.bin"

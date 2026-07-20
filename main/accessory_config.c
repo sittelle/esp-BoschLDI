@@ -14,6 +14,14 @@
 #define ACCESSORY_CONFIG_HUE_BRIDGE_ID_KEY "hue_bridge"
 #define ACCESSORY_CONFIG_HUE_BRIDGE_NAME_KEY "hue_name"
 #define ACCESSORY_CONFIG_HUE_APP_KEY_KEY "hue_key"
+#define ACCESSORY_CONFIG_HA_ENABLED_KEY "ha_enabled"
+#define ACCESSORY_CONFIG_HA_HOST_KEY "ha_host"
+#define ACCESSORY_CONFIG_HA_PORT_KEY "ha_port"
+#define ACCESSORY_CONFIG_HA_USERNAME_KEY "ha_user"
+#define ACCESSORY_CONFIG_HA_PASSWORD_KEY "ha_pass"
+#define ACCESSORY_CONFIG_HA_PREFIX_KEY "ha_prefix"
+#define ACCESSORY_CONFIG_HA_TOPIC_KEY "ha_topic"
+#define ACCESSORY_CONFIG_HA_INTERVAL_KEY "ha_sec"
 #define ACCESSORY_CONFIG_LED_ENABLED_KEY "led_enabled"
 #define ACCESSORY_CONFIG_LED_BRIGHTNESS_KEY "led_bright"
 #define ACCESSORY_CONFIG_LED_BOOT_KEY "led_boot"
@@ -131,6 +139,20 @@ uint32_t accessory_config_clamp_bike_interval(uint32_t seconds)
     return clamp_interval(seconds, ACCESSORY_EXPORT_BIKE_MIN_INTERVAL_SEC);
 }
 
+uint32_t accessory_config_clamp_ha_interval(uint32_t seconds)
+{
+    if (seconds == 0) {
+        return ACCESSORY_HA_MIN_INTERVAL_SEC;
+    }
+    if (seconds < ACCESSORY_HA_MIN_INTERVAL_SEC) {
+        return ACCESSORY_HA_MIN_INTERVAL_SEC;
+    }
+    if (seconds > ACCESSORY_HA_MAX_INTERVAL_SEC) {
+        return ACCESSORY_HA_MAX_INTERVAL_SEC;
+    }
+    return seconds;
+}
+
 uint8_t accessory_config_clamp_led_brightness(uint32_t percent)
 {
     if (percent < ACCESSORY_LED_BRIGHTNESS_MIN) {
@@ -187,7 +209,7 @@ static void accessory_led_defaults(accessory_led_config_t *out)
 {
     memset(out, 0, sizeof(*out));
     out->enabled = true;
-    out->brightness_percent = 80;
+    out->brightness_percent = 20;
     out->boot_color = 0x303030;
     out->advertising_color = 0x000060;
     out->connected_color = 0x603000;
@@ -357,6 +379,127 @@ esp_err_t accessory_config_save_export(const accessory_export_config_t *config)
     if (err == ESP_OK) {
         err = nvs_set_u32(nvs, ACCESSORY_CONFIG_BIKE_INTERVAL_KEY,
                           accessory_config_clamp_bike_interval(config->bike_interval_sec));
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+static void accessory_ha_defaults(accessory_ha_config_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->enabled = false;
+    out->port = ACCESSORY_HA_DEFAULT_PORT;
+    strlcpy(out->discovery_prefix, ACCESSORY_HA_DEFAULT_DISCOVERY_PREFIX,
+            sizeof(out->discovery_prefix));
+    strlcpy(out->topic_base, ACCESSORY_HA_DEFAULT_TOPIC_BASE, sizeof(out->topic_base));
+    out->interval_sec = 5;
+}
+
+bool accessory_config_ha_is_valid(const accessory_ha_config_t *config)
+{
+    if (config == NULL ||
+        !config_ascii_token_is_valid(config->host, ACCESSORY_HA_HOST_MAX_LEN, true) ||
+        !config_ascii_token_is_valid(config->username, ACCESSORY_HA_USERNAME_MAX_LEN, true) ||
+        !config_ascii_token_is_valid(config->password, ACCESSORY_HA_PASSWORD_MAX_LEN, true) ||
+        !config_ascii_token_is_valid(config->discovery_prefix,
+                                     ACCESSORY_HA_DISCOVERY_PREFIX_MAX_LEN, false) ||
+        !config_ascii_token_is_valid(config->topic_base,
+                                     ACCESSORY_HA_TOPIC_BASE_MAX_LEN, false)) {
+        return false;
+    }
+    return config->port > 0;
+}
+
+esp_err_t accessory_config_load_ha(accessory_ha_config_t *out)
+{
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    accessory_ha_defaults(out);
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(ACCESSORY_CONFIG_NAMESPACE, NVS_READONLY, &nvs);
+    if (err != ESP_OK) {
+        return err == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : err;
+    }
+
+    uint8_t enabled = out->enabled ? 1 : 0;
+    uint16_t port = out->port;
+    nvs_get_u8(nvs, ACCESSORY_CONFIG_HA_ENABLED_KEY, &enabled);
+    nvs_get_str_default(nvs, ACCESSORY_CONFIG_HA_HOST_KEY, out->host, sizeof(out->host));
+    nvs_get_u16(nvs, ACCESSORY_CONFIG_HA_PORT_KEY, &port);
+    nvs_get_str_default(nvs, ACCESSORY_CONFIG_HA_USERNAME_KEY,
+                        out->username, sizeof(out->username));
+    nvs_get_str_default(nvs, ACCESSORY_CONFIG_HA_PASSWORD_KEY,
+                        out->password, sizeof(out->password));
+    nvs_get_str_default(nvs, ACCESSORY_CONFIG_HA_PREFIX_KEY,
+                        out->discovery_prefix, sizeof(out->discovery_prefix));
+    nvs_get_str_default(nvs, ACCESSORY_CONFIG_HA_TOPIC_KEY,
+                        out->topic_base, sizeof(out->topic_base));
+    nvs_get_u32(nvs, ACCESSORY_CONFIG_HA_INTERVAL_KEY, &out->interval_sec);
+    nvs_close(nvs);
+
+    out->enabled = enabled != 0;
+    out->port = port == 0 ? ACCESSORY_HA_DEFAULT_PORT : port;
+    if (!config_ascii_token_is_valid(out->host, ACCESSORY_HA_HOST_MAX_LEN, true)) {
+        out->host[0] = '\0';
+    }
+    if (!config_ascii_token_is_valid(out->username, ACCESSORY_HA_USERNAME_MAX_LEN, true)) {
+        out->username[0] = '\0';
+    }
+    if (!config_ascii_token_is_valid(out->password, ACCESSORY_HA_PASSWORD_MAX_LEN, true)) {
+        out->password[0] = '\0';
+    }
+    if (!config_ascii_token_is_valid(out->discovery_prefix,
+                                     ACCESSORY_HA_DISCOVERY_PREFIX_MAX_LEN, false)) {
+        strlcpy(out->discovery_prefix, ACCESSORY_HA_DEFAULT_DISCOVERY_PREFIX,
+                sizeof(out->discovery_prefix));
+    }
+    if (!config_ascii_token_is_valid(out->topic_base,
+                                     ACCESSORY_HA_TOPIC_BASE_MAX_LEN, false)) {
+        strlcpy(out->topic_base, ACCESSORY_HA_DEFAULT_TOPIC_BASE, sizeof(out->topic_base));
+    }
+    out->interval_sec = accessory_config_clamp_ha_interval(out->interval_sec);
+    return ESP_OK;
+}
+
+esp_err_t accessory_config_save_ha(const accessory_ha_config_t *config)
+{
+    if (!accessory_config_ha_is_valid(config)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(ACCESSORY_CONFIG_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_u8(nvs, ACCESSORY_CONFIG_HA_ENABLED_KEY, config->enabled ? 1 : 0);
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, ACCESSORY_CONFIG_HA_HOST_KEY, config->host);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u16(nvs, ACCESSORY_CONFIG_HA_PORT_KEY, config->port);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, ACCESSORY_CONFIG_HA_USERNAME_KEY, config->username);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, ACCESSORY_CONFIG_HA_PASSWORD_KEY, config->password);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, ACCESSORY_CONFIG_HA_PREFIX_KEY, config->discovery_prefix);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, ACCESSORY_CONFIG_HA_TOPIC_KEY, config->topic_base);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u32(nvs, ACCESSORY_CONFIG_HA_INTERVAL_KEY,
+                          accessory_config_clamp_ha_interval(config->interval_sec));
     }
     if (err == ESP_OK) {
         err = nvs_commit(nvs);

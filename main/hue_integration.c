@@ -27,6 +27,7 @@
 #define HUE_RESOURCES_RESPONSE_SIZE 28000
 #define HUE_PAIR_WINDOW_ATTEMPTS 30
 #define HUE_PAIR_RETRY_DELAY_MS 2000
+#define HUE_DEVICES_CACHE_PATH "/spiffs/hue_devices.json"
 
 static const char *TAG = "hue";
 
@@ -45,6 +46,7 @@ typedef struct {
 static SemaphoreHandle_t hue_pair_lock;
 static bool hue_pair_running;
 static bool hue_pair_success;
+static bool hue_pair_cancel_requested;
 static unsigned hue_pair_attempt;
 static char hue_pair_host[ACCESSORY_HUE_HOST_MAX_LEN + 1];
 static char hue_pair_last_json[HUE_PAIR_RESPONSE_SIZE];
@@ -65,6 +67,9 @@ static void hue_pair_set_state(bool running, bool success, unsigned attempt,
     }
     hue_pair_running = running;
     hue_pair_success = success;
+    if (running) {
+        hue_pair_cancel_requested = false;
+    }
     hue_pair_attempt = attempt;
     if (host != NULL) {
         strlcpy(hue_pair_host, host, sizeof(hue_pair_host));
@@ -473,6 +478,25 @@ static void hue_pair_task(void *arg)
     }
 
     for (unsigned attempt = 1; attempt <= HUE_PAIR_WINDOW_ATTEMPTS; attempt++) {
+        hue_pair_lock_init();
+        bool canceled = false;
+        if (hue_pair_lock != NULL) {
+            xSemaphoreTake(hue_pair_lock, portMAX_DELAY);
+            canceled = hue_pair_cancel_requested;
+            xSemaphoreGive(hue_pair_lock);
+        }
+        if (canceled) {
+            snprintf(response, HUE_PAIR_RESPONSE_SIZE,
+                     "{\"type\":\"hue_pair\",\"paired\":false,\"bridge_host\":\"%s\","
+                     "\"error\":\"Hue pairing canceled\"}",
+                     host);
+            hue_pair_set_state(false, false, attempt > 0 ? attempt - 1 : 0, host, response);
+            persistent_log_event("info", "hue", "pairing canceled host=%s", host);
+            free(response);
+            vTaskDelete(NULL);
+            return;
+        }
+
         esp_err_t err = hue_integration_pair_json(host, response, HUE_PAIR_RESPONSE_SIZE);
         bool paired = err == ESP_OK;
         hue_pair_set_state(!paired, paired, attempt, host, response);
@@ -569,6 +593,32 @@ esp_err_t hue_integration_pair_start_json(const char *bridge_host, char *out, si
     return ESP_OK;
 }
 
+esp_err_t hue_integration_pair_cancel_json(char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    hue_pair_lock_init();
+    bool was_running = false;
+    if (hue_pair_lock != NULL) {
+        xSemaphoreTake(hue_pair_lock, portMAX_DELAY);
+        was_running = hue_pair_running;
+        if (hue_pair_running) {
+            hue_pair_cancel_requested = true;
+        }
+        xSemaphoreGive(hue_pair_lock);
+    }
+
+    snprintf(out, out_len,
+             "{\"type\":\"hue_pair_cancel\",\"cancel_requested\":%s,\"running\":%s}",
+             was_running ? "true" : "false", was_running ? "true" : "false");
+    if (was_running) {
+        persistent_log_event("info", "hue", "pairing cancel requested");
+    }
+    return ESP_OK;
+}
+
 esp_err_t hue_integration_pair_progress_json(char *out, size_t out_len)
 {
     if (out == NULL || out_len == 0) {
@@ -662,9 +712,100 @@ static esp_err_t hue_bridge_get_json(const char *path, const char *type,
     return ESP_OK;
 }
 
+static esp_err_t hue_devices_cache_write(const char *json)
+{
+    if (json == NULL || json[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    FILE *f = fopen(HUE_DEVICES_CACHE_PATH, "w");
+    if (f == NULL) {
+        return ESP_FAIL;
+    }
+    fwrite(json, 1, strlen(json), f);
+    fclose(f);
+    return ESP_OK;
+}
+
+static esp_err_t hue_devices_cache_read(char *out, size_t out_len,
+                                        const accessory_hue_config_t *config,
+                                        const char *error)
+{
+    FILE *f = fopen(HUE_DEVICES_CACHE_PATH, "r");
+    if (f == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    char *cached = malloc(out_len);
+    if (cached == NULL) {
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
+    size_t len = fread(cached, 1, out_len - 1, f);
+    fclose(f);
+    cached[len] = '\0';
+
+    cJSON *root = cJSON_Parse(cached);
+    free(cached);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    cJSON_DeleteItemFromObject(root, "cached");
+    cJSON_DeleteItemFromObject(root, "available");
+    cJSON_DeleteItemFromObject(root, "error");
+    cJSON_AddBoolToObject(root, "cached", true);
+    cJSON_AddBoolToObject(root, "available", false);
+    cJSON_AddStringToObject(root, "error", error != NULL ? error : "Hue Bridge unavailable");
+    if (config != NULL) {
+        if (cJSON_GetObjectItem(root, "bridge_host") == NULL) {
+            cJSON_AddStringToObject(root, "bridge_host", config->bridge_host);
+        }
+        if (cJSON_GetObjectItem(root, "bridge_name") == NULL) {
+            cJSON_AddStringToObject(root, "bridge_name", config->bridge_name);
+        }
+    }
+
+    char *printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (printed == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    strlcpy(out, printed, out_len);
+    cJSON_free(printed);
+    return ESP_OK;
+}
+
 esp_err_t hue_integration_devices_json(char *out, size_t out_len)
 {
-    return hue_bridge_get_json("/lights", "hue_devices", out, out_len);
+    accessory_hue_config_t config;
+    accessory_config_load_hue(&config);
+    esp_err_t err = hue_bridge_get_json("/lights", "hue_devices", out, out_len);
+    if (err == ESP_OK) {
+        cJSON *root = cJSON_Parse(out);
+        if (cJSON_IsObject(root)) {
+            cJSON_DeleteItemFromObject(root, "cached");
+            cJSON_DeleteItemFromObject(root, "available");
+            cJSON_AddBoolToObject(root, "cached", false);
+            cJSON_AddBoolToObject(root, "available", true);
+            char *printed = cJSON_PrintUnformatted(root);
+            if (printed != NULL) {
+                strlcpy(out, printed, out_len);
+                hue_devices_cache_write(printed);
+                cJSON_free(printed);
+            }
+        }
+        cJSON_Delete(root);
+        return ESP_OK;
+    }
+
+    esp_err_t cache_err = hue_devices_cache_read(out, out_len, &config,
+                                                 "Hue Bridge request failed");
+    if (cache_err == ESP_OK) {
+        persistent_log_event("warn", "hue", "serving cached Hue devices");
+        return ESP_OK;
+    }
+    return err;
 }
 
 esp_err_t hue_integration_resources_json(char *out, size_t out_len)
@@ -738,6 +879,7 @@ esp_err_t hue_integration_clear_pairing_json(char *out, size_t out_len)
     snprintf(out, out_len, "{\"type\":\"hue_clear\",\"cleared\":%s}",
              err == ESP_OK ? "true" : "false");
     if (err == ESP_OK) {
+        remove(HUE_DEVICES_CACHE_PATH);
         persistent_log_event("info", "hue", "local Hue pairing cleared");
     }
     return err;

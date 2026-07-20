@@ -5,6 +5,7 @@ idf_component_register(
         "automation.c"
         "ble_gap.c"
         "gatt_client.c"
+        "home_assistant.c"
         "hue_integration.c"
         "live_data_decode.c"
         "log_store.c"
@@ -22,6 +23,7 @@ idf_component_register(
         esp_netif
         json
         mdns
+        mqtt
         esp_wifi
         nvs_flash
         spiffs

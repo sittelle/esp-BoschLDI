@@ -120,16 +120,26 @@ static void write_color(rgb_t color)
     }
 }
 
+static rgb_t scale_color(uint8_t red, uint8_t green, uint8_t blue)
+{
+    uint32_t brightness = led_config.brightness_percent;
+    return (rgb_t){
+        .red = (uint8_t)((red * brightness) / 100),
+        .green = (uint8_t)((green * brightness) / 100),
+        .blue = (uint8_t)((blue * brightness) / 100),
+    };
+}
+
 static void led_task(void *arg)
 {
     (void)arg;
     const rgb_t off = {0, 0, 0};
 
-    write_color((rgb_t){128, 0, 0});
+    write_color(scale_color(128, 0, 0));
     vTaskDelay(pdMS_TO_TICKS(300));
-    write_color((rgb_t){0, 128, 0});
+    write_color(scale_color(0, 128, 0));
     vTaskDelay(pdMS_TO_TICKS(300));
-    write_color((rgb_t){0, 0, 128});
+    write_color(scale_color(0, 0, 128));
     vTaskDelay(pdMS_TO_TICKS(300));
     write_color(off);
     vTaskDelay(pdMS_TO_TICKS(120));

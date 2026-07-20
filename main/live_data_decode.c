@@ -3,13 +3,30 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "automation.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "persistent_log.h"
 
 static const char *TAG = "live_data";
+#define LIVE_DATA_LATEST_PATH "/spiffs/latest_bike.json"
+#define LIVE_DATA_LATEST_JSON_MAX_LEN 1400
+#define LIVE_DATA_MAX_UNKNOWN_FIELDS 12
+#define LIVE_DATA_LATEST_PERSIST_INTERVAL_US (5LL * 1000LL * 1000LL)
+
+bool live_data_latest_json(char *out, size_t out_len);
+
+typedef struct {
+    bool present;
+    uint32_t field_id;
+    uint32_t wire_type;
+    uint64_t value;
+    uint32_t length;
+} live_data_unknown_field_t;
 
 typedef struct {
     bool has_speed;
@@ -38,9 +55,30 @@ typedef struct {
     bool diagnosis_program_active;
     bool has_bike_not_driving;
     bool bike_not_driving;
+    live_data_unknown_field_t unknown[LIVE_DATA_MAX_UNKNOWN_FIELDS];
+    uint8_t unknown_count;
+    int64_t last_update_boot_ms;
+    int64_t last_update_unix_time;
 } live_data_t;
 
 static live_data_t latest_state;
+static char persisted_latest_json[LIVE_DATA_LATEST_JSON_MAX_LEN];
+static bool persisted_latest_loaded;
+static int64_t last_latest_persist_us;
+
+static bool read_fixed_le(const uint8_t *buf, size_t len, size_t *pos, size_t bytes, uint64_t *value)
+{
+    if (len - *pos < bytes || value == NULL) {
+        return false;
+    }
+    uint64_t result = 0;
+    for (size_t i = 0; i < bytes; i++) {
+        result |= ((uint64_t)buf[*pos + i]) << (8 * i);
+    }
+    *pos += bytes;
+    *value = result;
+    return true;
+}
 
 static bool read_varint(const uint8_t *buf, size_t len, size_t *pos, uint64_t *value)
 {
@@ -160,6 +198,46 @@ static void append_field(char *out, size_t out_len, const char *fmt, ...)
     va_end(args);
 }
 
+static void upsert_unknown_field(live_data_t *data, uint32_t field_id, uint32_t wire_type,
+                                 uint64_t value, uint32_t length)
+{
+    if (data == NULL) {
+        return;
+    }
+    for (uint8_t i = 0; i < data->unknown_count; i++) {
+        if (data->unknown[i].field_id == field_id &&
+            data->unknown[i].wire_type == wire_type) {
+            data->unknown[i].value = value;
+            data->unknown[i].length = length;
+            return;
+        }
+    }
+    if (data->unknown_count >= LIVE_DATA_MAX_UNKNOWN_FIELDS) {
+        return;
+    }
+    live_data_unknown_field_t *field = &data->unknown[data->unknown_count++];
+    field->present = true;
+    field->field_id = field_id;
+    field->wire_type = wire_type;
+    field->value = value;
+    field->length = length;
+}
+
+static bool unknown_field_changed(const live_data_unknown_field_t *field)
+{
+    if (field == NULL || !field->present) {
+        return false;
+    }
+    for (uint8_t i = 0; i < latest_state.unknown_count; i++) {
+        const live_data_unknown_field_t *existing = &latest_state.unknown[i];
+        if (existing->field_id == field->field_id &&
+            existing->wire_type == field->wire_type) {
+            return existing->value != field->value || existing->length != field->length;
+        }
+    }
+    return true;
+}
+
 static void merge_latest_state(const live_data_t *data)
 {
     if (data->has_speed) {
@@ -214,6 +292,79 @@ static void merge_latest_state(const live_data_t *data)
         latest_state.has_bike_not_driving = true;
         latest_state.bike_not_driving = data->bike_not_driving;
     }
+    for (uint8_t i = 0; i < data->unknown_count; i++) {
+        upsert_unknown_field(&latest_state, data->unknown[i].field_id,
+                             data->unknown[i].wire_type, data->unknown[i].value,
+                             data->unknown[i].length);
+    }
+    latest_state.last_update_boot_ms = esp_timer_get_time() / 1000;
+    if (data->has_time) {
+        latest_state.last_update_unix_time = data->time;
+    }
+}
+
+static uint32_t changed_field_mask(const live_data_t *data)
+{
+    uint32_t changed = 0;
+    if (data->has_speed && (!latest_state.has_speed || latest_state.speed != data->speed)) {
+        changed |= LIVE_DATA_FIELD_SPEED;
+    }
+    if (data->has_cadence &&
+        (!latest_state.has_cadence || latest_state.cadence != data->cadence)) {
+        changed |= LIVE_DATA_FIELD_CADENCE;
+    }
+    if (data->has_rider_power &&
+        (!latest_state.has_rider_power || latest_state.rider_power != data->rider_power)) {
+        changed |= LIVE_DATA_FIELD_RIDER_POWER;
+    }
+    if (data->has_ambient_brightness &&
+        (!latest_state.has_ambient_brightness ||
+         latest_state.ambient_brightness != data->ambient_brightness)) {
+        changed |= LIVE_DATA_FIELD_AMBIENT_BRIGHTNESS;
+    }
+    if (data->has_battery_soc &&
+        (!latest_state.has_battery_soc || latest_state.battery_soc != data->battery_soc)) {
+        changed |= LIVE_DATA_FIELD_BATTERY_SOC;
+    }
+    if (data->has_odometer &&
+        (!latest_state.has_odometer || latest_state.odometer != data->odometer)) {
+        changed |= LIVE_DATA_FIELD_ODOMETER;
+    }
+    if (data->has_bike_light &&
+        (!latest_state.has_bike_light || latest_state.bike_light != data->bike_light)) {
+        changed |= LIVE_DATA_FIELD_BIKE_LIGHT;
+    }
+    if (data->has_system_locked &&
+        (!latest_state.has_system_locked || latest_state.system_locked != data->system_locked)) {
+        changed |= LIVE_DATA_FIELD_SYSTEM_LOCKED;
+    }
+    if (data->has_charger_connected &&
+        (!latest_state.has_charger_connected ||
+         latest_state.charger_connected != data->charger_connected)) {
+        changed |= LIVE_DATA_FIELD_CHARGER_CONNECTED;
+    }
+    if (data->has_light_reserve_state &&
+        (!latest_state.has_light_reserve_state ||
+         latest_state.light_reserve_state != data->light_reserve_state)) {
+        changed |= LIVE_DATA_FIELD_LIGHT_RESERVE;
+    }
+    if (data->has_diagnosis_program_active &&
+        (!latest_state.has_diagnosis_program_active ||
+         latest_state.diagnosis_program_active != data->diagnosis_program_active)) {
+        changed |= LIVE_DATA_FIELD_DIAGNOSIS_ACTIVE;
+    }
+    if (data->has_bike_not_driving &&
+        (!latest_state.has_bike_not_driving ||
+         latest_state.bike_not_driving != data->bike_not_driving)) {
+        changed |= LIVE_DATA_FIELD_BIKE_NOT_DRIVING;
+    }
+    for (uint8_t i = 0; i < data->unknown_count; i++) {
+        if (unknown_field_changed(&data->unknown[i])) {
+            changed |= LIVE_DATA_FIELD_UNKNOWN;
+            break;
+        }
+    }
+    return changed;
 }
 
 static void format_live_data_sample(const live_data_t *data, char *summary, size_t summary_len)
@@ -269,6 +420,17 @@ static void persist_live_data_sample(const live_data_t *data)
     }
 }
 
+static bool live_data_state_has_any(const live_data_t *data)
+{
+    return data != NULL &&
+           (data->has_speed || data->has_cadence || data->has_rider_power ||
+            data->has_ambient_brightness || data->has_battery_soc || data->has_time ||
+            data->has_odometer || data->has_bike_light || data->has_system_locked ||
+            data->has_charger_connected || data->has_light_reserve_state ||
+            data->has_diagnosis_program_active || data->has_bike_not_driving ||
+            data->unknown_count > 0);
+}
+
 bool live_data_latest_summary(char *out, size_t out_len)
 {
     if (out == NULL || out_len == 0) {
@@ -283,6 +445,59 @@ bool live_data_latest_summary(char *out, size_t out_len)
     return false;
 }
 
+static void persist_latest_state_json(void)
+{
+    char *json = malloc(LIVE_DATA_LATEST_JSON_MAX_LEN);
+    if (json == NULL) {
+        return;
+    }
+    if (!live_data_latest_json(json, LIVE_DATA_LATEST_JSON_MAX_LEN)) {
+        free(json);
+        return;
+    }
+
+    FILE *f = fopen(LIVE_DATA_LATEST_PATH, "w");
+    if (f == NULL) {
+        free(json);
+        return;
+    }
+    fwrite(json, 1, strlen(json), f);
+    fclose(f);
+    strlcpy(persisted_latest_json, json, sizeof(persisted_latest_json));
+    persisted_latest_loaded = true;
+    free(json);
+}
+
+static void persist_latest_state_json_if_due(uint32_t changed_mask)
+{
+    int64_t now = esp_timer_get_time();
+    if (changed_mask == 0 &&
+        last_latest_persist_us != 0 &&
+        now - last_latest_persist_us < LIVE_DATA_LATEST_PERSIST_INTERVAL_US) {
+        return;
+    }
+    last_latest_persist_us = now;
+    persist_latest_state_json();
+}
+
+void live_data_init(void)
+{
+    FILE *f = fopen(LIVE_DATA_LATEST_PATH, "r");
+    if (f == NULL) {
+        persisted_latest_json[0] = '\0';
+        persisted_latest_loaded = false;
+        return;
+    }
+
+    size_t len = fread(persisted_latest_json, 1, sizeof(persisted_latest_json) - 1, f);
+    fclose(f);
+    persisted_latest_json[len] = '\0';
+    persisted_latest_loaded = len > 0;
+    if (persisted_latest_loaded) {
+        ESP_LOGI(TAG, "loaded persisted latest bike data snapshot");
+    }
+}
+
 bool live_data_latest_json(char *out, size_t out_len)
 {
     if (out == NULL || out_len == 0) {
@@ -290,7 +505,13 @@ bool live_data_latest_json(char *out, size_t out_len)
     }
 
     live_data_t data = latest_state;
-    bool has_any = false;
+    bool has_any = live_data_state_has_any(&data);
+    if (!has_any && persisted_latest_loaded) {
+        strlcpy(out, persisted_latest_json, out_len);
+        return out[0] != '\0';
+    }
+
+    bool needs_comma = false;
     int written = snprintf(out, out_len, "{");
     if (written < 0 || (size_t)written >= out_len) {
         return false;
@@ -299,10 +520,26 @@ bool live_data_latest_json(char *out, size_t out_len)
 #define ADD_JSON_FIELD(fmt, ...) do { \
         size_t used = strlen(out); \
         if (used + 1 < out_len) { \
-            snprintf(out + used, out_len - used, "%s" fmt, has_any ? "," : "", __VA_ARGS__); \
-            has_any = true; \
+            snprintf(out + used, out_len - used, "%s" fmt, needs_comma ? "," : "", __VA_ARGS__); \
+            needs_comma = true; \
         } \
     } while (0)
+
+    if (data.last_update_boot_ms > 0) {
+        ADD_JSON_FIELD("\"last_update_boot_ms\":%" PRId64, data.last_update_boot_ms);
+    }
+    if (data.last_update_unix_time > 0) {
+        char iso[32] = {0};
+        time_t unix_time = (time_t)data.last_update_unix_time;
+        struct tm tm_utc = {0};
+        if (gmtime_r(&unix_time, &tm_utc) != NULL) {
+            strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+        }
+        ADD_JSON_FIELD("\"last_update_unix_time\":%" PRId64, data.last_update_unix_time);
+        if (iso[0] != '\0') {
+            ADD_JSON_FIELD("\"last_update_iso_utc\":\"%s\"", iso);
+        }
+    }
 
     if (data.has_time) {
         ADD_JSON_FIELD("\"time\":%" PRId64, data.time);
@@ -344,6 +581,24 @@ bool live_data_latest_json(char *out, size_t out_len)
         ADD_JSON_FIELD("\"bike_not_driving\":%s", data.bike_not_driving ? "true" : "false");
     }
 #undef ADD_JSON_FIELD
+
+    if (data.unknown_count > 0) {
+        strlcat(out, needs_comma ? ",\"unknown_fields\":[" : "\"unknown_fields\":[", out_len);
+        for (uint8_t i = 0; i < data.unknown_count; i++) {
+            char item[128];
+            snprintf(item, sizeof(item),
+                     "%s{\"field_id\":%" PRIu32 ",\"wire_type\":%" PRIu32
+                     ",\"raw_value\":%" PRIu64 ",\"length\":%" PRIu32 "}",
+                     i == 0 ? "" : ",",
+                     data.unknown[i].field_id,
+                     data.unknown[i].wire_type,
+                     data.unknown[i].value,
+                     data.unknown[i].length);
+            strlcat(out, item, out_len);
+        }
+        strlcat(out, "]", out_len);
+        has_any = true;
+    }
 
     strlcat(out, "}", out_len);
     return has_any;
@@ -407,6 +662,50 @@ bool live_data_latest_field_value(const char *field, double *out)
     return false;
 }
 
+uint32_t live_data_field_mask(const char *field)
+{
+    if (field == NULL) {
+        return 0;
+    }
+    if (strcmp(field, "speed_kmh") == 0) {
+        return LIVE_DATA_FIELD_SPEED;
+    }
+    if (strcmp(field, "cadence_rpm") == 0) {
+        return LIVE_DATA_FIELD_CADENCE;
+    }
+    if (strcmp(field, "rider_power_w") == 0) {
+        return LIVE_DATA_FIELD_RIDER_POWER;
+    }
+    if (strcmp(field, "ambient_brightness_lux") == 0) {
+        return LIVE_DATA_FIELD_AMBIENT_BRIGHTNESS;
+    }
+    if (strcmp(field, "battery_soc") == 0) {
+        return LIVE_DATA_FIELD_BATTERY_SOC;
+    }
+    if (strcmp(field, "odometer_m") == 0) {
+        return LIVE_DATA_FIELD_ODOMETER;
+    }
+    if (strcmp(field, "bike_light") == 0) {
+        return LIVE_DATA_FIELD_BIKE_LIGHT;
+    }
+    if (strcmp(field, "system_locked") == 0) {
+        return LIVE_DATA_FIELD_SYSTEM_LOCKED;
+    }
+    if (strcmp(field, "charger_connected") == 0) {
+        return LIVE_DATA_FIELD_CHARGER_CONNECTED;
+    }
+    if (strcmp(field, "light_reserve_state") == 0) {
+        return LIVE_DATA_FIELD_LIGHT_RESERVE;
+    }
+    if (strcmp(field, "diagnosis_program_active") == 0) {
+        return LIVE_DATA_FIELD_DIAGNOSIS_ACTIVE;
+    }
+    if (strcmp(field, "bike_not_driving") == 0) {
+        return LIVE_DATA_FIELD_BIKE_NOT_DRIVING;
+    }
+    return 0;
+}
+
 bool live_data_decode_and_log(const uint8_t *buf, size_t len)
 {
     live_data_t data = {0};
@@ -422,9 +721,29 @@ bool live_data_decode_and_log(const uint8_t *buf, size_t len)
         uint32_t field = key >> 3;
         uint32_t wire_type = key & 0x07;
         if (wire_type != 0) {
-            if (!skip_field(buf, len, &pos, wire_type)) {
+            uint64_t raw = 0;
+            uint32_t length = 0;
+            if (wire_type == 1) {
+                if (!read_fixed_le(buf, len, &pos, 8, &raw)) {
+                    return false;
+                }
+                length = 8;
+            } else if (wire_type == 2) {
+                uint64_t field_len = 0;
+                if (!read_varint(buf, len, &pos, &field_len) || field_len > len - pos) {
+                    return false;
+                }
+                length = (uint32_t)field_len;
+                pos += (size_t)field_len;
+            } else if (wire_type == 5) {
+                if (!read_fixed_le(buf, len, &pos, 4, &raw)) {
+                    return false;
+                }
+                length = 4;
+            } else if (!skip_field(buf, len, &pos, wire_type)) {
                 return false;
             }
+            upsert_unknown_field(&data, field, wire_type, raw, length);
             continue;
         }
 
@@ -486,13 +805,16 @@ bool live_data_decode_and_log(const uint8_t *buf, size_t len)
             data.bike_not_driving = value != 0;
             break;
         default:
+            upsert_unknown_field(&data, field, wire_type, value, 0);
             break;
         }
     }
 
+    uint32_t changed_mask = changed_field_mask(&data);
     log_live_data(&data);
     merge_latest_state(&data);
     persist_live_data_sample(&latest_state);
-    automation_request_evaluate();
+    persist_latest_state_json_if_due(changed_mask);
+    automation_request_evaluate(changed_mask);
     return true;
 }

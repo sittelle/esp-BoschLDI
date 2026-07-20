@@ -10,6 +10,7 @@ esp_err_t hue_integration_status_json(char *out, size_t out_len);
 esp_err_t hue_integration_pair_json(const char *bridge_host, char *out, size_t out_len);
 esp_err_t hue_integration_pair_start_json(const char *bridge_host, char *out, size_t out_len);
 esp_err_t hue_integration_pair_progress_json(char *out, size_t out_len);
+esp_err_t hue_integration_pair_cancel_json(char *out, size_t out_len);
 esp_err_t hue_integration_devices_json(char *out, size_t out_len);
 esp_err_t hue_integration_resources_json(char *out, size_t out_len);
 esp_err_t hue_integration_clear_pairing_json(char *out, size_t out_len);

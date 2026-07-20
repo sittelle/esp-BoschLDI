@@ -30,6 +30,7 @@ The firmware is configured for an ESP32-S3 target. Other ESP32 variants will nee
 - Provides a Wi-Fi setup/admin UI.
 - Provides local JSON APIs for polling.
 - Optionally pushes logs and bike data to configured HTTP(S) endpoints.
+- Optionally publishes bike data to Home Assistant through MQTT Discovery.
 - Discovers Philips Hue Bridges on the LAN as the first step toward Hue smart plug integration.
 
 ## Bosch Live Data Mapping
@@ -57,6 +58,7 @@ The protobuf decoder is dependency-free and hand-written for the known public Li
 - `main/wifi_admin.c`: setup AP, web UI, local APIs, Wi-Fi config
 - `main/accessory_config.c`: persisted device/export configuration in NVS
 - `main/telemetry_export.c`: optional push export worker
+- `main/home_assistant.c`: optional MQTT Discovery and state publisher for Home Assistant
 - `main/hue_integration.c`: Philips Hue Bridge discovery
 - `main/persistent_log.c`: SPIFFS-backed rotated bike/connection log
 - `main/log_store.c`: in-memory runtime log ring
@@ -93,7 +95,29 @@ Find the serial port:
 pio device list
 ```
 
-Build and flash:
+Recommended deployment command:
+
+```powershell
+.\deploy.ps1 -Port COMx
+```
+
+By default this builds the app, flashes only the app partition, preserves local NVS state such as Wi-Fi credentials and Hue pairing, uses a conservative `460800` baud upload speed, and verifies the web UI at `http://boschldi.local/config`.
+
+Full flash for a fresh board:
+
+```powershell
+.\deploy.ps1 -Port COMx -Full -Configure
+```
+
+Useful deployment options:
+
+- `-Baud 230400`: use an even slower upload speed
+- `-SkipBuild`: flash the existing build artifact
+- `-Clean` or `-Configure`: regenerate build state before flashing
+- `-NoVerify`: skip the post-flash web check
+- `-VerifyUrl http://192.168.x.y/config`: verify by IP when mDNS is unavailable
+
+Low-level build and flash:
 
 ```powershell
 .\tools\pio-upload.ps1 -Port COMx -Environment esp32s3
@@ -143,8 +167,8 @@ The dashboard has six tabs:
 - **Bike data**: latest decoded bike state and persistent bike log downloads
 - **Logs**: searchable/filterable runtime log viewer
 - **Hue**: Hue Bridge discovery, pairing, and a readable device list
-- **Automation**: planned bike-data-to-Hue rule editor, shown when a Hue Bridge is paired
-- **Configuration**: BLE accessory name, optional push export, internal RGB LED, Wi-Fi configuration
+- **Automation**: bike-data-to-Hue rule editor, shown when a Hue Bridge is paired
+- **Configuration**: BLE accessory name, optional push export, Home Assistant MQTT, internal RGB LED, Wi-Fi configuration
 - **Documentation**: built-in endpoint and configuration reference
 
 The configured device name is used for the BLE accessory relationship with the bike. It does not change DNS; the network hostname remains `boschldi`.
@@ -162,7 +186,7 @@ Read endpoints:
 - `GET /api/hue/pair/progress`: current background Hue pairing status
 - `GET /api/hue/devices`: Hue Bridge `lights` resource, including lamps and smart plugs exposed as controllable light resources
 - `GET /api/hue/resources`: full local Hue Bridge v1 state for debugging
-- `GET /config`: current device name, push export, LED, and Wi-Fi status settings
+- `GET /config`: current device name, push export, Home Assistant MQTT, LED, and Wi-Fi status settings
 - `GET /scan`: nearby Wi-Fi networks as JSON
 - `GET /logs`: runtime logs as plain text
 - `GET /latest`: latest decoded bike state as plain text
@@ -182,6 +206,15 @@ Configuration endpoints use `application/x-www-form-urlencoded` form bodies:
   - `logs_interval_sec`
   - `bike_url`
   - `bike_interval_sec`
+- `POST /ha-config`
+  - `ha_enabled`: optional checkbox value; omitted means off
+  - `ha_host`: MQTT broker host or IP
+  - `ha_port`: MQTT broker port, default `1883`
+  - `ha_username`: optional MQTT username
+  - `ha_password`: optional MQTT password; blank keeps the stored password
+  - `ha_discovery_prefix`: default `homeassistant`
+  - `ha_topic_base`: default `boschldi`
+  - `ha_interval_sec`: clamped to 2-3600 seconds
 - `POST /led-config`
   - `led_enabled`: optional checkbox value; omitted means off
   - `led_brightness_percent`: clamped to 1-100
@@ -202,12 +235,32 @@ Configuration endpoints use `application/x-www-form-urlencoded` form bodies:
   - `light_id`: numeric Hue v1 light id from `/api/hue/devices`
   - `action_on`: `true`, `1`, or `on` turns on; any other value turns off
   - `cooldown_sec`: clamped to 5-3600
+  - Stored JSON may also contain up to 3 `conditions` entries. All conditions are combined with AND.
+- `POST /api/automation/default`
+  - `light_id`: numeric Hue v1 light id from `/api/hue/devices`
+  - Adds the built-in example rule: `battery_soc < 35` AND `battery_soc < 70` AND `bike_not_driving == 1`, then turn the selected Hue smart plug/device on.
 - `POST /api/automation/clear`
   - Clears all stored automation rules
 - `POST /api/hue/clear`
   - Clears the locally stored Hue Bridge host and app key
 
 Empty push URLs disable push export.
+
+## Home Assistant
+
+Home Assistant support uses MQTT Discovery, which is the native Home Assistant path for MQTT devices. Configure an MQTT broker in Home Assistant, keep discovery enabled, then enter the broker settings in the ESP Configuration tab.
+
+Reference:
+
+- Home Assistant MQTT integration and discovery: <https://www.home-assistant.io/integrations/mqtt/>
+
+Default MQTT topics:
+
+- Discovery configs: `homeassistant/<component>/boschldi_<entity>/config`
+- Availability: `boschldi/status`
+- Latest bike state: `boschldi/state`
+
+Discovery payloads are retained so Home Assistant can recreate entities after its own restart. The ESP publishes the latest decoded bike JSON at the configured interval and exposes individual Home Assistant entities through value templates. The firmware does not store a Home Assistant REST API token.
 
 ## Polling Guidance
 
@@ -265,7 +318,7 @@ The first implementation uses the local Hue v1 HTTP API because it is reliable o
 
 ## Automation
 
-Automation rules are stored in NVS as a small JSON array, capped at six rules. Rules are evaluated only when fresh Bosch Live Data arrives from the bike. Each rule has a cooldown, so a matching condition cannot toggle the same Hue target continuously on every notification.
+Automation rules are stored in NVS as a small JSON array, capped at six rules. The automation worker starts at boot, but evaluation requests are queued only when at least one enabled automation rule exists. Rules are evaluated only when fresh Bosch Live Data arrives from the bike. Each rule has a cooldown, so a matching condition cannot toggle the same Hue target continuously on every notification.
 
 The first rule engine supports numeric comparisons against decoded bike fields and Hue on/off actions. Supported fields currently include `speed_kmh`, `cadence_rpm`, `rider_power_w`, `ambient_brightness_lux`, `battery_soc`, `odometer_m`, `bike_light`, `system_locked`, `charger_connected`, `light_reserve_state`, `diagnosis_program_active`, and `bike_not_driving`.
 

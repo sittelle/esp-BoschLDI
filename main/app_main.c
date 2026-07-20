@@ -1,5 +1,7 @@
 #include "automation.h"
 #include "ble_gap.h"
+#include "home_assistant.h"
+#include "live_data_decode.h"
 #include "log_store.h"
 #include "persistent_log.h"
 #include "status_led.h"
@@ -86,6 +88,7 @@ void app_main(void)
     } else {
         persistent_log_event("info", "system", "boot reset_reason=%s(%d)",
                              reset_reason_name(reset_reason), (int)reset_reason);
+        live_data_init();
     }
 
     err = status_led_init();
@@ -112,6 +115,11 @@ void app_main(void)
     err = automation_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "automation worker init failed; err=%s", esp_err_to_name(err));
+    }
+
+    err = home_assistant_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Home Assistant worker init failed; err=%s", esp_err_to_name(err));
     }
 
     ESP_ERROR_CHECK(nimble_port_init());

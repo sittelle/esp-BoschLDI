@@ -45,7 +45,7 @@
 #define WIFI_ADMIN_HUE_RESPONSE_SIZE 2048
 #define WIFI_ADMIN_HUE_DEVICES_RESPONSE_SIZE 20000
 #define WIFI_ADMIN_HUE_RESOURCES_RESPONSE_SIZE 28000
-#define WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE 4096
+#define WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE 8192
 
 static const char *TAG = "wifi_admin";
 static const EventBits_t WIFI_CONNECTED_BIT = BIT0;
@@ -481,21 +481,31 @@ static esp_err_t config_get_handler(httpd_req_t *req)
 {
     char device_name[ACCESSORY_DEVICE_NAME_MAX_LEN + 1];
     accessory_export_config_t export_config;
+    accessory_ha_config_t ha_config;
     accessory_led_config_t led_config;
     wifi_credentials_t saved = {0};
     accessory_config_load_device_name(device_name, sizeof(device_name));
     accessory_config_load_export(&export_config);
+    accessory_config_load_ha(&ha_config);
     accessory_config_load_led(&led_config);
     esp_err_t saved_err = load_credentials(&saved);
 
     char escaped_name[64];
     char escaped_logs_url[192];
     char escaped_bike_url[192];
+    char escaped_ha_host[96];
+    char escaped_ha_username[96];
+    char escaped_ha_prefix[64];
+    char escaped_ha_topic[96];
     char escaped_current_ssid[96];
     char escaped_saved_ssid[96];
     json_escape(escaped_name, sizeof(escaped_name), device_name);
     json_escape(escaped_logs_url, sizeof(escaped_logs_url), export_config.logs_url);
     json_escape(escaped_bike_url, sizeof(escaped_bike_url), export_config.bike_url);
+    json_escape(escaped_ha_host, sizeof(escaped_ha_host), ha_config.host);
+    json_escape(escaped_ha_username, sizeof(escaped_ha_username), ha_config.username);
+    json_escape(escaped_ha_prefix, sizeof(escaped_ha_prefix), ha_config.discovery_prefix);
+    json_escape(escaped_ha_topic, sizeof(escaped_ha_topic), ha_config.topic_base);
     json_escape(escaped_current_ssid, sizeof(escaped_current_ssid), current_ssid);
     json_escape(escaped_saved_ssid, sizeof(escaped_saved_ssid),
                 saved_err == ESP_OK ? saved.ssid : "");
@@ -515,11 +525,15 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     color_hex(activity_color, sizeof(activity_color), led_config.activity_color);
     color_hex(error_color, sizeof(error_color), led_config.error_color);
 
-    char response[1200];
+    char response[1800];
     snprintf(response, sizeof(response),
              "{\"device_name\":\"%s\",\"logs_url\":\"%s\",\"bike_url\":\"%s\","
              "\"logs_interval_sec\":%" PRIu32 ",\"bike_interval_sec\":%" PRIu32 ","
              "\"logs_min_interval_sec\":%u,\"bike_min_interval_sec\":%u,"
+             "\"ha_enabled\":%s,\"ha_host\":\"%s\",\"ha_port\":%u,"
+             "\"ha_username\":\"%s\",\"ha_discovery_prefix\":\"%s\","
+             "\"ha_topic_base\":\"%s\",\"ha_interval_sec\":%" PRIu32 ","
+             "\"ha_min_interval_sec\":%u,\"ha_max_interval_sec\":%u,"
              "\"max_interval_sec\":%u,\"current_ssid\":\"%s\",\"saved_ssid\":\"%s\","
              "\"wifi_connected\":%s,"
              "\"led_enabled\":%s,\"led_brightness_percent\":%u,"
@@ -531,6 +545,10 @@ static esp_err_t config_get_handler(httpd_req_t *req)
              export_config.logs_interval_sec, export_config.bike_interval_sec,
              ACCESSORY_EXPORT_LOG_MIN_INTERVAL_SEC,
              ACCESSORY_EXPORT_BIKE_MIN_INTERVAL_SEC,
+             ha_config.enabled ? "true" : "false", escaped_ha_host,
+             (unsigned)ha_config.port, escaped_ha_username, escaped_ha_prefix,
+             escaped_ha_topic, ha_config.interval_sec,
+             ACCESSORY_HA_MIN_INTERVAL_SEC, ACCESSORY_HA_MAX_INTERVAL_SEC,
              ACCESSORY_EXPORT_MAX_INTERVAL_SEC, escaped_current_ssid, escaped_saved_ssid,
              current_ssid[0] != '\0' ? "true" : "false",
              led_config.enabled ? "true" : "false",
@@ -571,9 +589,9 @@ static esp_err_t api_logs_get_handler(httpd_req_t *req)
 
 static esp_err_t api_bike_get_handler(httpd_req_t *req)
 {
-    char bike_json[768];
+    char bike_json[1536];
     bool has_data = live_data_latest_json(bike_json, sizeof(bike_json));
-    char response[1024];
+    char response[1800];
     snprintf(response, sizeof(response),
              "{\"type\":\"bike_data\",\"boot_ms\":%lld,\"has_data\":%s,\"data\":%s}",
              (long long)(esp_timer_get_time() / 1000),
@@ -585,7 +603,7 @@ static esp_err_t api_bike_get_handler(httpd_req_t *req)
 
 static esp_err_t api_state_get_handler(httpd_req_t *req)
 {
-    char bike_json[768];
+    char bike_json[1536];
     char *logs = malloc(WIFI_ADMIN_LOG_RESPONSE_SIZE);
     char *escaped_logs = malloc(WIFI_ADMIN_LOG_RESPONSE_SIZE * 2);
     if (logs == NULL || escaped_logs == NULL) {
@@ -634,20 +652,67 @@ static esp_err_t api_automation_rules_get_handler(httpd_req_t *req)
     return err;
 }
 
+static bool query_index(httpd_req_t *req, uint8_t *index)
+{
+    char query[48] = {0};
+    char value[8] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "index", value, sizeof(value)) != ESP_OK) {
+        return false;
+    }
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || parsed >= AUTOMATION_MAX_RULES) {
+        return false;
+    }
+    *index = (uint8_t)parsed;
+    return true;
+}
+
+static char *read_request_body(httpd_req_t *req, size_t max_len)
+{
+    if (req->content_len <= 0 || req->content_len >= max_len) {
+        return NULL;
+    }
+    char *body = calloc(1, req->content_len + 1);
+    if (body == NULL) {
+        return NULL;
+    }
+    int read_len = httpd_req_recv(req, body, req->content_len);
+    if (read_len <= 0) {
+        free(body);
+        return NULL;
+    }
+    body[read_len] = '\0';
+    return body;
+}
+
 static esp_err_t api_automation_rule_post_handler(httpd_req_t *req)
 {
-    char body[256] = {0};
-    if (req->content_len <= 0 || req->content_len >= (int)sizeof(body)) {
+    char *body = read_request_body(req, 2048);
+    if (body == NULL) {
         httpd_resp_set_status(req, "400 Bad Request");
         return httpd_resp_sendstr(req, "{\"error\":\"Invalid form\"}");
     }
 
-    int read_len = httpd_req_recv(req, body, req->content_len);
-    if (read_len <= 0) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_sendstr(req, "{\"error\":\"Could not read form\"}");
+    char *response = malloc(WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    if (response == NULL) {
+        free(body);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"automation response allocation failed\"}");
     }
-    body[read_len] = '\0';
+
+    if (body[0] == '{') {
+        esp_err_t err = automation_add_rule_json(body, response, WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+        httpd_resp_set_type(req, "application/json");
+        if (err != ESP_OK) {
+            httpd_resp_set_status(req, "400 Bad Request");
+        }
+        err = httpd_resp_sendstr(req, response);
+        free(body);
+        free(response);
+        return err;
+    }
 
     automation_rule_t rule = {0};
     char enabled[4];
@@ -669,13 +734,192 @@ static esp_err_t api_automation_rule_post_handler(httpd_req_t *req)
                      strcmp(action_on, "on") == 0;
     rule.cooldown_sec = (uint32_t)strtoul(cooldown, NULL, 10);
 
+    esp_err_t err = automation_add_rule(&rule, response, WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    httpd_resp_set_type(req, "application/json");
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+    }
+    err = httpd_resp_sendstr(req, response);
+    free(body);
+    free(response);
+    return err;
+}
+
+static esp_err_t api_automation_rule_update_post_handler(httpd_req_t *req)
+{
+    uint8_t index = 0;
+    if (!query_index(req, &index)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"Missing or invalid index\"}");
+    }
+
+    char *body = read_request_body(req, 2048);
+    if (body == NULL) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"Invalid JSON\"}");
+    }
+
+    char *response = malloc(WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    if (response == NULL) {
+        free(body);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"automation response allocation failed\"}");
+    }
+
+    esp_err_t err = automation_update_rule_json(index, body, response,
+                                                WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    httpd_resp_set_type(req, "application/json");
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, err == ESP_ERR_NOT_FOUND ? "404 Not Found" : "400 Bad Request");
+    }
+    err = httpd_resp_sendstr(req, response);
+    free(body);
+    free(response);
+    return err;
+}
+
+static esp_err_t api_automation_rule_enabled_post_handler(httpd_req_t *req)
+{
+    char *body = read_request_body(req, 96);
+    if (body == NULL) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"Invalid form\"}");
+    }
+
+    char index_text[8];
+    char enabled_text[8];
+    form_value(body, "index", index_text, sizeof(index_text));
+    form_value(body, "enabled", enabled_text, sizeof(enabled_text));
+    char *end = NULL;
+    unsigned long parsed = strtoul(index_text, &end, 10);
+    if (end == index_text || *end != '\0' || parsed >= AUTOMATION_MAX_RULES) {
+        free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"Missing or invalid index\"}");
+    }
+    bool enabled = strcmp(enabled_text, "1") == 0 ||
+                   strcmp(enabled_text, "true") == 0 ||
+                   strcmp(enabled_text, "on") == 0;
+
+    char *response = malloc(WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    if (response == NULL) {
+        free(body);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"automation response allocation failed\"}");
+    }
+
+    esp_err_t err = automation_set_rule_enabled((uint8_t)parsed, enabled, response,
+                                                WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    httpd_resp_set_type(req, "application/json");
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, err == ESP_ERR_NOT_FOUND ? "404 Not Found" : "400 Bad Request");
+    }
+    err = httpd_resp_sendstr(req, response);
+    free(body);
+    free(response);
+    return err;
+}
+
+static esp_err_t api_automation_rule_delete_post_handler(httpd_req_t *req)
+{
+    char *body = read_request_body(req, 64);
+    if (body == NULL) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"Invalid form\"}");
+    }
+
+    char index_text[8];
+    form_value(body, "index", index_text, sizeof(index_text));
+    char *end = NULL;
+    unsigned long parsed = strtoul(index_text, &end, 10);
+    if (end == index_text || *end != '\0' || parsed >= AUTOMATION_MAX_RULES) {
+        free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"Missing or invalid index\"}");
+    }
+
+    char *response = malloc(WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    if (response == NULL) {
+        free(body);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"automation response allocation failed\"}");
+    }
+
+    esp_err_t err = automation_delete_rule((uint8_t)parsed, response,
+                                           WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    httpd_resp_set_type(req, "application/json");
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, err == ESP_ERR_NOT_FOUND ? "404 Not Found" : "400 Bad Request");
+    }
+    err = httpd_resp_sendstr(req, response);
+    free(body);
+    free(response);
+    return err;
+}
+
+static esp_err_t api_automation_rule_test_post_handler(httpd_req_t *req)
+{
+    char *body = read_request_body(req, 64);
+    if (body == NULL) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"Invalid form\"}");
+    }
+
+    char index_text[8];
+    form_value(body, "index", index_text, sizeof(index_text));
+    char *end = NULL;
+    unsigned long parsed = strtoul(index_text, &end, 10);
+    if (end == index_text || *end != '\0' || parsed >= AUTOMATION_MAX_RULES) {
+        free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"Missing or invalid index\"}");
+    }
+
+    char *response = malloc(WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    if (response == NULL) {
+        free(body);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"automation response allocation failed\"}");
+    }
+
+    esp_err_t err = automation_test_rule_triggers((uint8_t)parsed, response,
+                                                  WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    httpd_resp_set_type(req, "application/json");
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, err == ESP_ERR_NOT_FOUND ? "404 Not Found" : "400 Bad Request");
+    }
+    err = httpd_resp_sendstr(req, response);
+    free(body);
+    free(response);
+    return err;
+}
+
+static esp_err_t api_automation_default_post_handler(httpd_req_t *req)
+{
+    char body[96] = {0};
+    if (req->content_len <= 0 || req->content_len >= (int)sizeof(body)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"Invalid form\"}");
+    }
+
+    int read_len = httpd_req_recv(req, body, req->content_len);
+    if (read_len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"Could not read form\"}");
+    }
+    body[read_len] = '\0';
+
+    char light_id[AUTOMATION_LIGHT_ID_MAX_LEN + 1];
+    form_value(body, "light_id", light_id, sizeof(light_id));
+
     char *response = malloc(WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
     if (response == NULL) {
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_sendstr(req, "{\"error\":\"automation response allocation failed\"}");
     }
 
-    esp_err_t err = automation_add_rule(&rule, response, WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
+    esp_err_t err = automation_add_default_low_battery_rule(
+        light_id, response, WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
     httpd_resp_set_type(req, "application/json");
     if (err != ESP_OK) {
         httpd_resp_set_status(req, "400 Bad Request");
@@ -814,6 +1058,18 @@ static esp_err_t api_hue_pair_progress_get_handler(httpd_req_t *req)
     return send_hue_json_response(req, response, err);
 }
 
+static esp_err_t api_hue_pair_cancel_post_handler(httpd_req_t *req)
+{
+    char *response = malloc(WIFI_ADMIN_HUE_RESPONSE_SIZE);
+    if (response == NULL) {
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"error\":\"hue response allocation failed\"}");
+    }
+
+    esp_err_t err = hue_integration_pair_cancel_json(response, WIFI_ADMIN_HUE_RESPONSE_SIZE);
+    return send_hue_json_response(req, response, err);
+}
+
 static esp_err_t api_hue_devices_get_handler(httpd_req_t *req)
 {
     char *response = malloc(WIFI_ADMIN_HUE_DEVICES_RESPONSE_SIZE);
@@ -923,37 +1179,57 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
     static const char page[] =
         "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
         "<title>Bosch LDI</title><style>"
-        "body{font-family:system-ui,sans-serif;margin:0;background:#f6f7f8;color:#171717}"
-        "header{padding:16px 20px;background:#fff;border-bottom:1px solid #ddd}"
+        ":root{--header-h:66px;--nav-h:46px;--footer-h:28px}"
+        "body{font-family:system-ui,sans-serif;margin:0;background:#f6f7f8;color:#171717;overflow:hidden}"
+        "header{position:fixed;top:0;left:0;right:0;height:var(--header-h);box-sizing:border-box;z-index:10;padding:16px 20px;background:#fff;border-bottom:1px solid #ddd}"
         "h1{font-size:20px;margin:0}.meta{color:#555;margin-top:4px}"
-        "nav{display:flex;gap:4px;padding:0 20px;background:#fff;border-bottom:1px solid #ddd}"
-        ".tabbtn{border:0;background:#fff;border-bottom:3px solid transparent;margin:0;padding:12px 14px;cursor:pointer}"
-        ".tabbtn.active{border-bottom-color:#1769aa;color:#0f4f82;font-weight:700}"
-        "main{padding:16px 20px}.tab{display:none}.tab.active{display:block}"
+        "nav{position:fixed;top:var(--header-h);left:0;right:0;height:var(--nav-h);box-sizing:border-box;z-index:10;display:flex;gap:4px;padding:0 20px;background:#fff;border-bottom:1px solid #ddd;overflow-x:auto}"
+        ".tabbtn{border:0;background:#fff;border-bottom:3px solid transparent;margin:0;padding:12px 14px;cursor:pointer;border-radius:0;box-shadow:none}"
+        ".tabbtn.active{border-bottom-color:#1769aa;color:#0f4f82;font-weight:700}.tabbtn.warnflag{color:#6b4200}.tabbtn.warnflag::after{content:' !';font-weight:800}"
+        "main{position:fixed;top:calc(var(--header-h) + var(--nav-h));bottom:var(--footer-h);left:0;right:0;overflow:hidden;padding:16px 20px;box-sizing:border-box}"
+        "footer{position:fixed;left:0;right:0;bottom:0;height:var(--footer-h);z-index:10;background:#fff;border-top:1px solid #ddd}"
+        ".tab{display:none;height:100%;overflow:auto;box-sizing:border-box;padding:2px 2px 28px;scrollbar-gutter:stable}.tab.active{display:block}"
         ".label{font-size:13px;font-weight:700;margin:12px 0 6px}"
         ".hint{color:#555;margin:4px 0 10px}"
-        "section{margin:0 0 18px}.wifi{display:grid;gap:8px;max-width:520px}"
+        "section{margin:0 0 18px}.wifi{display:grid;gap:8px;width:100%}"
         "label,input,select{font-size:15px}input,select{padding:8px;width:100%;box-sizing:border-box}"
+        ".formline{display:grid;grid-template-columns:minmax(120px,180px) minmax(0,1fr) auto;gap:8px;align-items:center}.formline label{margin:0}.formline button{margin:0}"
         ".tools{display:grid;grid-template-columns:minmax(180px,1fr) 140px minmax(130px,220px) auto;gap:8px;align-items:end}"
         ".check{display:flex;gap:6px;align-items:center;white-space:nowrap}.check input{width:auto}"
         ".count{color:#555;font-size:13px;margin:0 0 6px}.empty{color:#aaa}"
         ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin:10px 0 16px}"
         ".device{background:#fff;border:1px solid #d8dde2;border-radius:6px;padding:12px;display:grid;gap:7px}"
         ".device h3{font-size:16px;margin:0}.row{display:flex;justify-content:space-between;gap:10px;align-items:center}"
+        ".cond_row{grid-template-columns:minmax(180px,1fr) 86px minmax(110px,160px) auto;align-items:end}.trigger_row{grid-template-columns:minmax(220px,1fr) 140px auto;align-items:end}.cond_row label,.trigger_row label{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}.cond_row button,.trigger_row button{margin:0}"
         ".muted{color:#666}.badge{font-size:12px;border-radius:999px;padding:2px 8px;background:#edf0f2;color:#333;white-space:nowrap}"
-        ".on{background:#d7f4df;color:#125d25}.off{background:#eceff1;color:#4d555c}.warn{background:#ffe8c2;color:#6b4200}"
+        ".on{background:#d7f4df;color:#125d25}.off{background:#eceff1;color:#4d555c}.warn{background:#ffe8c2;color:#6b4200}.rulewarn{border-left:4px solid #d18b00}.warntext{color:#6b4200;font-weight:600}"
         ".plan{background:#fff;border-left:4px solid #1769aa;padding:12px 14px;margin:10px 0 16px}"
-        ".ledgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;max-width:780px}"
-        ".ledgrid input[type=color]{height:38px;padding:2px}"
+        ".sidebar-layout{display:grid;grid-template-columns:220px minmax(0,1fr);gap:18px;height:100%;min-height:0;overflow:hidden}"
+        ".sidebar{background:#fff;border:1px solid #d8dde2;border-radius:6px;padding:8px;overflow:auto;align-self:start;max-height:100%;box-sizing:border-box}"
+        ".sidebar button{display:block;width:100%;text-align:left;margin:0 0 4px;padding:9px 10px;background:#fff;border:0;border-radius:4px;cursor:pointer;box-shadow:none}"
+        ".sidebar button.active{background:#e7f1f8;color:#0f4f82;font-weight:700}"
+        ".sidebar-content{overflow:auto;min-height:0;height:100%;box-sizing:border-box;padding:2px 8px 28px 2px;scrollbar-gutter:stable}.config-panel{display:none;width:100%;max-width:none}.config-panel.active{display:block}"
+        ".info-list{background:#fff;border:1px solid #d8dde2;border-radius:6px;padding:10px 14px;margin:8px 0 14px;line-height:1.45}"
         ".tablewrap{overflow:auto;background:#fff;border:1px solid #d8dde2;border-radius:6px;margin:10px 0 16px}"
         "table{width:100%;border-collapse:collapse;min-width:760px}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #e6e9ec;font-size:14px}th{background:#f1f3f5;font-weight:700}"
-        ".doc{max-width:900px}.doc p,.doc li{line-height:1.45}.doc code{background:#e9ecef;padding:1px 4px;border-radius:3px}"
+        ".rowactions{display:flex;gap:6px;flex-wrap:wrap}.rowactions button{margin:0}.iconbtn{width:34px;height:34px;display:inline-grid;place-items:center;padding:0;margin:0 6px 10px 0;font-size:18px;line-height:1}.rowactions .iconbtn{margin:0}.iconbtn.danger{font-size:20px}"
+        ".toast{position:fixed;right:16px;top:16px;z-index:20;background:#7a1f1f;color:#fff;border-radius:6px;padding:12px 40px 12px 14px;max-width:360px;box-shadow:0 8px 24px #0003}"
+        ".toast.ok{background:#176b3a}.toast.error{background:#7a1f1f}"
+        ".toast button{position:absolute;right:6px;top:4px;margin:0;background:transparent;color:#fff;border:0;font-size:20px;cursor:pointer}"
+        ".modal{position:fixed;inset:0;z-index:15;background:#0008;display:none;align-items:center;justify-content:center;padding:18px}"
+        ".modal.open{display:flex}.dialog{background:#fff;color:#171717;border-radius:6px;max-width:760px;width:100%;max-height:86vh;overflow:auto;padding:18px;box-shadow:0 18px 48px #0007}"
+        ".dialog h2{font-size:18px;margin:0 0 10px}.spinner{width:28px;height:28px;border:4px solid #d7dde2;border-top-color:#1769aa;border-radius:50%;animation:spin 1s linear infinite}"
+        ".pairbox{display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:center;margin:12px 0}@keyframes spin{to{transform:rotate(360deg)}}"
+        ".doc{max-width:none}.doc p,.doc li{line-height:1.45}.doc code{background:#e9ecef;padding:1px 4px;border-radius:3px}"
         "pre{white-space:pre-wrap;background:#111;color:#e8e8e8;"
         "padding:14px;border-radius:6px;overflow:auto;font:13px/1.45 ui-monospace,Consolas,monospace}"
         "#latest{min-height:42px;background:#fff;color:#171717;border:1px solid #ddd}"
         "#log{height:58vh;margin-top:0}"
-        "@media(max-width:760px){.tools{grid-template-columns:1fr 1fr}.check{align-self:center}}"
-        "button{font-size:15px;padding:8px 12px;margin:0 8px 12px 0}</style></head><body>"
+        "@media(max-width:760px){:root{--header-h:66px;--nav-h:48px;--footer-h:28px}.tools{grid-template-columns:1fr 1fr}.check{align-self:center}.formline{grid-template-columns:1fr}.sidebar-layout{display:grid;grid-template-rows:auto minmax(0,1fr);grid-template-columns:1fr}.sidebar{display:flex;gap:6px;overflow:auto;margin-bottom:12px}.sidebar button{white-space:nowrap;width:auto}.sidebar-content{overflow:auto;height:100%;padding:2px 2px 28px}.cond_row,.trigger_row{grid-template-columns:1fr 80px}.cond_row .cond_value,.trigger_row .trig_action_on{grid-column:1}.cond_row button,.trigger_row button{grid-column:2}}"
+        "button{font-size:15px;padding:8px 12px;margin:0 8px 12px 0;border:1px solid #c6d0d9;border-radius:6px;background:#fff;color:#17212b;cursor:pointer;box-shadow:0 1px 2px #0001;transition:background .15s,border-color .15s,box-shadow .15s}"
+        "button:hover:not(:disabled){background:#f1f6fa;border-color:#9fb4c6;box-shadow:0 2px 6px #0002}button:active:not(:disabled){background:#e5eef5;box-shadow:inset 0 1px 3px #0002}"
+        "button:disabled{opacity:.5;cursor:not-allowed;box-shadow:none}.primary{background:#1769aa;border-color:#1769aa;color:#fff}.primary:hover:not(:disabled){background:#10578f;border-color:#10578f}.danger{border-color:#d1a0a0;color:#8a1f1f}.danger:hover:not(:disabled){background:#fff1f1;border-color:#bd7777}"
+        "</style></head><body>"
         "<header><h1>Bosch LDI</h1><div class=meta>Host: boschldi.local</div></header>"
         "<nav><button class='tabbtn active' data-tab=bike onclick=\"showTab('bike')\">Bike data</button>"
         "<button class=tabbtn data-tab=logs onclick=\"showTab('logs')\">Logs</button>"
@@ -961,11 +1237,26 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<button id=automation_tab_btn class=tabbtn data-tab=automation onclick=\"showTab('automation')\" style='display:none'>Automation</button>"
         "<button class=tabbtn data-tab=config onclick=\"showTab('config')\">Configuration</button>"
         "<button class=tabbtn data-tab=docs onclick=\"showTab('docs')\">Documentation</button></nav>"
-        "<main><section id=bike class='tab active'><button onclick=load()>Refresh</button>"
+        "<div id=toast_root></div><div id=pair_modal class=modal><div class=dialog><h2>Hue Bridge pairing</h2>"
+        "<div class=pairbox><div class=spinner></div><div><div id=pair_msg>Please press the button on the Hue Bridge.</div>"
+        "<div id=pair_meta class=muted></div></div></div><button onclick=cancelHuePairing()>Cancel</button></div></div>"
+        "<div id=devices_modal class=modal onpointerdown='modalPointerDown(event)' onclick='modalBackdropClick(event,closeHueDevicesModal)'><div class=dialog>"
+        "<div class=row><h2>Hue devices</h2><button class=iconbtn title=Close aria-label=Close onclick=closeHueDevicesModal()>&times;</button></div><div id=hue_devices_modal class=tablewrap></div></div></div>"
+        "<div id=automation_modal class=modal onpointerdown='modalPointerDown(event)' onclick='modalBackdropClick(event,closeAutomationModal)'><div class=dialog>"
+        "<div class=row><h2 id=auto_modal_title>New automation</h2><button class=iconbtn title=Close aria-label=Close onclick=closeAutomationModal()>&times;</button></div>"
+        "<form class=wifi onsubmit='return saveAutomationModal(event)'><div class=formline><label>Name</label><input id=auto_name maxlength=39 value='New automation'></div>"
+        "<div class=label>Conditions</div><div class=formline><label>Connect groups</label><select id=auto_group_logic><option value=AND>All groups must match</option><option value=OR>Any group may match</option></select></div>"
+        "<div id=auto_groups></div><button type=button onclick=addConditionGroup()>Add condition group</button>"
+        "<div id=auto_field_help class=hint></div><div class=label>Triggers</div><div id=auto_triggers></div>"
+        "<button type=button onclick=addTriggerRow()>Add trigger</button><div class=label>Options</div>"
+        "<div class=formline><label>Cooldown seconds</label><input id=auto_cooldown_sec name=cooldown_sec type=number min=5 max=3600 value=30></div>"
+        "<label class=check><input id=auto_enabled name=enabled type=checkbox checked>Enabled</label>"
+        "<button class=primary type=submit>Save automation</button></form></div></div>"
+        "<main><section id=bike class='tab active'><button class=primary onclick=load()>Refresh</button>"
         "<button onclick=\"location.href='/bike-log'\">Bike file</button>"
         "<button onclick=\"location.href='/bike-log/previous'\">Previous file</button>"
         "<div class=label>Latest bike state</div><pre id=latest>Loading...</pre></section>"
-        "<section id=logs class=tab><button onclick=load()>Refresh</button>"
+        "<section id=logs class=tab><button class=primary onclick=load()>Refresh</button>"
         "<button onclick=\"location.href='/api/logs'\">Logs JSON</button>"
         "<button onclick=\"location.href='/logs'\">Raw runtime logs</button>"
         "<div class=label>Runtime logs</div><div class=tools>"
@@ -975,64 +1266,59 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<input id=tag placeholder='Filter source' oninput=renderLogs()>"
         "<label class=check><input id=follow type=checkbox checked>Follow</label></div>"
         "<div id=count class=count>0 lines</div><pre id=log>Loading...</pre></section>"
-        "<section id=config class=tab><div class=label>Accessory device name</div>"
-        "<form class=wifi method=post action=/device-name>"
+        "<section id=config class=tab><div class=sidebar-layout><aside class=sidebar>"
+        "<button class=active data-config-panel=device onclick=\"showConfigPanel('device')\">Device</button>"
+        "<button data-config-panel=push onclick=\"showConfigPanel('push')\">Push service</button>"
+        "<button data-config-panel=mqtt onclick=\"showConfigPanel('mqtt')\">MQTT service</button></aside>"
+        "<div class=sidebar-content><div id=config_device class='config-panel active'>"
+        "<div class=label>Accessory device name</div>"
+        "<form class=wifi method=post action=/device-name onsubmit=\"return postFormToast(event,'Device name saved','Device name save failed')\">"
         "<label>Name shown to the bike</label><input id=device_name name=device_name maxlength=24>"
         "<button type=submit>Save name</button></form>"
-        "<div class=label>JSON export</div><form class=wifi method=post action=/export-config>"
-        "<label>Logs URL</label><input id=logs_url name=logs_url placeholder='https://example.com/logs'>"
-        "<label>Logs interval seconds</label><input id=logs_interval_sec name=logs_interval_sec type=number min=60 max=3600>"
-        "<label>Bike data URL</label><input id=bike_url name=bike_url placeholder='https://example.com/bike'>"
-        "<label>Bike data interval seconds</label><input id=bike_interval_sec name=bike_interval_sec type=number min=10 max=3600>"
-        "<button type=submit>Save export</button></form>"
-        "<div class=label>Internal RGB LED</div><form class=wifi method=post action=/led-config>"
+        "<div class=label>Internal RGB LED</div><form class=wifi method=post action=/led-config onsubmit=\"return postFormToast(event,'LED settings saved','LED settings save failed')\">"
         "<label class=check><input id=led_enabled name=led_enabled type=checkbox value=1>Enabled</label>"
         "<label>Brightness percent</label><input id=led_brightness_percent name=led_brightness_percent type=number min=1 max=100>"
-        "<div class=ledgrid>"
-        "<label>Boot<input id=led_boot_color name=led_boot_color type=color></label>"
-        "<label>Bike pairing<input id=led_advertising_color name=led_advertising_color type=color></label>"
-        "<label>Bike connected<input id=led_connected_color name=led_connected_color type=color></label>"
-        "<label>Secured<input id=led_secured_color name=led_secured_color type=color></label>"
-        "<label>Live data ready<input id=led_ready_color name=led_ready_color type=color></label>"
-        "<label>Bike data activity<input id=led_activity_color name=led_activity_color type=color></label>"
-        "<label>Error<input id=led_error_color name=led_error_color type=color></label>"
-        "</div><button type=submit>Save LED</button></form>"
+        "<button type=submit>Save LED</button></form>"
+        "<div class=hint>LED meanings: grey boot, blue bike pairing, yellow bike connected, cyan secured, green live data ready, white bike data activity, red error.</div>"
         "<div class=label>Wi-Fi</div><div id=wifi_status class=hint>Loading Wi-Fi status...</div>"
         "<button id=wifi_change_btn onclick=showWifiChange()>Change Wi-Fi</button>"
-        "<form id=wifi_form class=wifi method=post action=/save onsubmit='return confirmWifiChange()' style='display:none'>"
+        "<form id=wifi_form class=wifi method=post action=/save onsubmit='return submitWifiChange(event)' style='display:none'>"
         "<label>Network</label><select id=ssid name=ssid><option>Press Change Wi-Fi to scan</option></select>"
         "<label>Password</label><input name=pass type=password autocomplete=current-password>"
-        "<button type=submit>Try and save if successful</button></form><div id=wifi_msg class=hint></div>"
+        "<button type=submit>Try and save if successful</button></form><div id=wifi_msg class=hint></div></div>"
+        "<div id=config_push class=config-panel><div class=label>Push service</div>"
+        "<form class=wifi method=post action=/export-config onsubmit=\"return postFormToast(event,'JSON export saved','JSON export save failed')\">"
+        "<label>Push logs to URL</label><input id=logs_url name=logs_url placeholder='https://example.com/logs'>"
+        "<label>Logs interval seconds</label><input id=logs_interval_sec name=logs_interval_sec type=number min=60 max=3600>"
+        "<label>Push bike data to URL</label><input id=bike_url name=bike_url placeholder='https://example.com/bike'>"
+        "<label>Bike data interval seconds</label><input id=bike_interval_sec name=bike_interval_sec type=number min=10 max=3600>"
+        "<button type=submit>Save push service</button></form><div class=hint>Empty URLs disable pushing for that data type.</div></div>"
+        "<div id=config_mqtt class=config-panel><div class=label>MQTT service</div>"
+        "<form class=wifi method=post action=/ha-config onsubmit=\"return postFormToast(event,'MQTT settings saved','MQTT settings save failed')\">"
+        "<label class=check><input id=ha_enabled name=ha_enabled type=checkbox value=1>Enable MQTT Discovery</label>"
+        "<label>MQTT broker host</label><input id=ha_host name=ha_host placeholder='homeassistant.local or broker IP'>"
+        "<label>MQTT broker port</label><input id=ha_port name=ha_port type=number min=1 max=65535 value=1883>"
+        "<label>MQTT username</label><input id=ha_username name=ha_username autocomplete=username>"
+        "<label>MQTT password</label><input id=ha_password name=ha_password type=password autocomplete=current-password placeholder='leave empty to keep stored password'>"
+        "<label>Discovery prefix</label><input id=ha_discovery_prefix name=ha_discovery_prefix maxlength=31>"
+        "<label>Topic base</label><input id=ha_topic_base name=ha_topic_base maxlength=63>"
+        "<label>Publish interval seconds</label><input id=ha_interval_sec name=ha_interval_sec type=number min=2 max=3600>"
+        "<button type=submit>Save MQTT service</button></form></div></div></div>"
         "</section><section id=hue class=tab><div class=label>Philips Hue</div>"
         "<div id=hue_status class=hint>Loading Hue status...</div>"
-        "<div class=actions><button onclick=discoverHue()>Discover Bridges</button>"
-        "<button onclick=startHuePairing()>Pair Bridge</button><button onclick=loadHueDevices()>Load Devices</button>"
-        "<button onclick=clearHue()>Clear Pairing</button></div>"
-        "<p class=hint>Click Pair Bridge, then press the physical Hue Bridge button. The ESP checks automatically for about one minute. Leave host empty to use the first discovered bridge.</p>"
-        "<label>Bridge host</label><input id=hue_host placeholder='auto or bridge IP'>"
-        "<div id=hue_devices class=tablewrap></div><pre id=hue_output>Hue Bridge discovery uses mDNS. Pairing stores a local Hue app key in NVS.</pre></section>"
+        "<div id=hue_actions class=actions><button id=hue_discover_btn onclick=discoverHue()>Discover Bridges</button></div>"
+        "<div id=hue_cards class=grid></div><pre id=hue_output>Hue Bridge discovery uses mDNS. Pairing stores a local Hue app key in NVS.</pre></section>"
         "<section id=automation class=tab><div class=label>Bike to Hue automation</div>"
-        "<form class=wifi onsubmit='return addAutomationRule(event)'>"
-        "<label><input id=auto_enabled name=enabled type=checkbox checked>Enabled</label>"
-        "<label>If bike field</label><select id=auto_field name=field>"
-        "<option value=speed_kmh>Speed km/h</option><option value=cadence_rpm>Cadence rpm</option>"
-        "<option value=rider_power_w>Rider power W</option><option value=ambient_brightness_lux>Ambient brightness lux</option>"
-        "<option value=battery_soc>Battery %</option><option value=odometer_m>Odometer m</option>"
-        "<option value=bike_light>Bike light: off=1, on=2</option><option value=system_locked>System locked</option>"
-        "<option value=charger_connected>Charger connected</option><option value=light_reserve_state>Light reserve</option>"
-        "<option value=diagnosis_program_active>Diagnosis active</option><option value=bike_not_driving>Bike not driving</option>"
-        "</select><label>Operator</label><select id=auto_op name=op><option>&lt;</option><option>&lt;=</option><option>==</option><option>&gt;=</option><option>&gt;</option></select>"
-        "<label>Value</label><input id=auto_value name=value type=number step=0.001 value=1>"
-        "<label>Hue device</label><select id=auto_light_id name=light_id><option value=''>Load Hue devices first</option></select>"
-        "<label>Action</label><select id=auto_action_on name=action_on><option value=true>Turn on</option><option value=false>Turn off</option></select>"
-        "<label>Cooldown seconds</label><input id=auto_cooldown_sec name=cooldown_sec type=number min=5 max=3600 value=30>"
-        "<button type=submit>Add rule</button></form><button onclick=clearAutomationRules()>Clear rules</button>"
-        "<div id=automation_rules class=grid></div><pre id=automation_preview>Rules run only when fresh bike data arrives.</pre></section>"
+        "<div class=actions><button class=primary onclick=openAutomationModal()>Add automation</button>"
+        "<button onclick=addDefaultAutomationRule()>Add example low-battery smart plug rule</button>"
+        "<button onclick=clearAutomationRules()>Clear rules</button></div>"
+        "<p class=hint>Automations run only when fresh bike data arrives. Actions require Wi-Fi and a paired Hue Bridge.</p>"
+        "<div id=automation_rules class=tablewrap></div><pre id=automation_preview>Load Hue devices before adding a trigger.</pre></section>"
         "<section id=docs class='tab doc'><div class=label>How it works</div>"
-        "<p>This ESP32 advertises itself over BLE as a Bosch Live Data accessory. After the bike pairs, the ESP subscribes to Live Data notifications, decodes known fields, keeps the latest state in RAM, and writes a small rotated persistent bike log to flash.</p>"
+        "<p>This ESP32 advertises itself over BLE as a Bosch Live Data accessory. After the bike pairs, the ESP subscribes to Live Data notifications, decodes known fields, keeps the latest state in RAM, writes a compact latest-state snapshot to flash, and writes a small rotated persistent bike log.</p>"
         "<p>The web UI is served by the ESP over Wi-Fi. The network hostname stays <code>boschldi.local</code>. If saved Wi-Fi is unavailable, the setup access point starts and the setup page is available at <code>192.168.4.1</code>.</p>"
         "<div class=label>Read APIs</div><ul>"
-        "<li><code>GET /api/bike</code> latest decoded bike state as JSON.</li>"
+        "<li><code>GET /api/bike</code> latest decoded bike state as JSON, including last update metadata and unknown field IDs when present.</li>"
         "<li><code>GET /api/logs</code> runtime log ring as JSON.</li>"
         "<li><code>GET /api/state</code> bike state and runtime logs in one JSON response.</li>"
         "<li><code>GET /api/automation/rules</code> current bike-to-Hue rules.</li>"
@@ -1041,6 +1327,7 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<li><code>POST /api/hue/pair</code> optional form field <code>bridge_host</code>. Press the Bridge button first.</li>"
         "<li><code>POST /api/hue/pair/start</code> starts a one-minute background pairing window.</li>"
         "<li><code>GET /api/hue/pair/progress</code> current background pairing status.</li>"
+        "<li><code>POST /api/hue/pair/cancel</code> asks the current background pairing window to stop.</li>"
         "<li><code>GET /api/hue/devices</code> Hue v1 <code>lights</code> resource, including lamps and smart plugs exposed as controllable lights.</li>"
         "<li><code>POST /api/hue/light/state</code> form fields <code>light_id</code> and <code>on</code>; internal automation action endpoint.</li>"
         "<li><code>GET /api/hue/resources</code> full Hue v1 bridge state for debugging.</li>"
@@ -1052,12 +1339,23 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<li><code>POST /device-name</code> form field <code>device_name</code>. Changes the BLE accessory name shown to the bike, not DNS.</li>"
         "<li><code>POST /save</code> form fields <code>ssid</code> and <code>pass</code>. Tries the new Wi-Fi without reboot, saves only after success, and falls back to the previous saved Wi-Fi on failure.</li>"
         "<li><code>POST /export-config</code> form fields <code>logs_url</code>, <code>logs_interval_sec</code>, <code>bike_url</code>, <code>bike_interval_sec</code>. Empty URLs disable push export.</li>"
-        "<li><code>POST /api/automation/rule</code> form fields <code>enabled</code>, <code>field</code>, <code>op</code>, <code>value</code>, <code>light_id</code>, <code>action_on</code>, <code>cooldown_sec</code>.</li>"
+        "<li><code>POST /ha-config</code> form fields <code>ha_enabled</code>, <code>ha_host</code>, <code>ha_port</code>, <code>ha_username</code>, <code>ha_password</code>, <code>ha_discovery_prefix</code>, <code>ha_topic_base</code>, and <code>ha_interval_sec</code>. Blank password keeps the stored MQTT password.</li>"
+        "<li><code>POST /api/automation/rule</code> appends an automation rule. JSON payloads support grouped conditions and multiple triggers.</li>"
+        "<li><code>POST /api/automation/rule/update?index=N</code> replaces an existing rule with a JSON payload.</li>"
+        "<li><code>POST /api/automation/rule/enabled</code> form fields <code>index</code> and <code>enabled</code>.</li>"
+        "<li><code>POST /api/automation/rule/delete</code> form field <code>index</code>.</li>"
+        "<li><code>POST /api/automation/default</code> form field <code>light_id</code>. Adds the built-in low-battery, not-moving example rule.</li>"
         "<li><code>POST /api/automation/clear</code> removes all automation rules.</li></ul>"
         "<div class=label>Polling</div><p>Clients can poll <code>/api/bike</code> every 1-2 seconds. Poll <code>/api/logs</code> only while a user is watching logs. Push export remains optional and bounded by firmware interval limits.</p>"
-        "</section></main>"
-        "<script>let rawLogs='';let huePaired=false;function showTab(id){document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.id==id));"
-        "document.querySelectorAll('.tabbtn').forEach(x=>x.classList.toggle('active',x.dataset.tab==id));if(id=='logs')renderLogs();if(id=='config')loadConfig();if(id=='hue'){loadHueStatus();if(huePaired)loadHueDevices()}if(id=='automation')loadAutomation()}"
+        "<div class=label>Home Assistant</div><p>Enable MQTT Discovery in Home Assistant and enter the broker connection here. The ESP publishes retained discovery configs below <code>homeassistant/</code> by default, availability to <code>boschldi/status</code>, and latest bike JSON to <code>boschldi/state</code>. Home Assistant creates entities from the JSON fields; no Home Assistant REST token is stored on the ESP.</p>"
+        "</section></main><footer></footer>"
+        "<script>let rawLogs='';let huePaired=false;function validTab(id){return !!document.getElementById(id)&&document.getElementById(id).classList.contains('tab')}"
+        "function currentTab(){let id=(location.hash||'#bike').slice(1);return validTab(id)?id:'bike'}"
+        "function showTab(id,push){if(!validTab(id))id='bike';document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.id==id));"
+        "document.querySelectorAll('.tabbtn').forEach(x=>x.classList.toggle('active',x.dataset.tab==id));if(push!==false&&location.hash!='#'+id)history.pushState(null,'','#'+id);"
+        "if(id=='logs')renderLogs();if(id=='config')loadConfig();if(id=='hue'){loadHueStatus();if(huePaired)loadHueDevices(false)}if(id=='automation')loadAutomation()}"
+        "function showConfigPanel(id){document.querySelectorAll('.config-panel').forEach(x=>x.classList.toggle('active',x.id=='config_'+id));document.querySelectorAll('[data-config-panel]').forEach(x=>x.classList.toggle('active',x.dataset.configPanel==id))}"
+        "window.addEventListener('popstate',()=>showTab(currentTab(),false));window.addEventListener('hashchange',()=>showTab(currentTab(),false));"
         "function logLevel(x){let m=x.match(/^[EWIDV]\\s*\\(/);if(m)return m[0][0];"
         "m=x.match(/\\b(error|warn|info|debug)\\b/i);return m?m[1][0].toUpperCase():''}"
         "function logTag(x){let m=x.match(/^[EWIDV]\\s*\\([^)]*\\)\\s+([^:]+):/);return m?m[1].toLowerCase():x.toLowerCase()}"
@@ -1077,11 +1375,13 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "async function scan(){let s=document.getElementById('ssid');document.getElementById('wifi_msg').textContent='Scanning nearby networks...';try{let r=await fetch('/scan',{cache:'no-store'});"
         "let a=await r.json();s.innerHTML='';a.forEach(n=>{let o=document.createElement('option');"
         "o.value=n.ssid;o.textContent=n.ssid+' ('+n.rssi+' dBm)';s.appendChild(o)});"
-        "if(!a.length)s.innerHTML='<option value=\"\">No networks found</option>';document.getElementById('wifi_msg').textContent='Select a network. The ESP will test it before saving.'}"
-        "catch(e){s.innerHTML='<option value=\"\">Scan failed</option>';document.getElementById('wifi_msg').textContent='Wi-Fi scan failed.'}}"
+        "if(!a.length)s.innerHTML='<option value=\"\">No networks found</option>';document.getElementById('wifi_msg').textContent='Select a network. The ESP will test it before saving.';showToast(a.length?'Wi-Fi scan complete':'No Wi-Fi networks found','ok',2500)}"
+        "catch(e){s.innerHTML='<option value=\"\">Scan failed</option>';document.getElementById('wifi_msg').textContent='Wi-Fi scan failed.';showToast('Wi-Fi scan failed','error')}}"
         "function showWifiChange(){document.getElementById('wifi_form').style.display='grid';scan()}"
-        "function confirmWifiChange(){let s=document.getElementById('ssid').value;"
-        "return confirm('The ESP32 will now leave the current Wi-Fi and try '+s+'. If it cannot connect, it will fall back to the previous saved Wi-Fi. Continue?')}"
+        "async function submitWifiChange(ev){ev.preventDefault();let f=ev.target,s=document.getElementById('ssid').value;"
+        "if(!confirm('The ESP32 will now leave the current Wi-Fi and try '+s+'. If it cannot connect, it will fall back to the previous saved Wi-Fi. Continue?'))return false;"
+        "try{let r=await fetch(f.action,{method:'POST',body:new URLSearchParams(new FormData(f))});if(!r.ok)throw new Error('HTTP '+r.status);showToast('Wi-Fi change submitted','ok',3000);document.getElementById('wifi_msg').textContent='Trying new Wi-Fi. If it fails, the ESP will fall back.';setTimeout(loadConfig,2500)}catch(e){showToast('Wi-Fi change failed','error');document.getElementById('wifi_msg').textContent='Wi-Fi change failed.'}return false}"
+        "async function postFormToast(ev,okMsg,failMsg){ev.preventDefault();let f=ev.target;try{let r=await fetch(f.action,{method:'POST',body:new URLSearchParams(new FormData(f))});if(!r.ok)throw new Error('HTTP '+r.status);showToast(okMsg,'ok',3000);setTimeout(loadConfig,600)}catch(e){showToast(failMsg,'error')}return false}"
         "async function loadConfig(){try{let r=await fetch('/config',{cache:'no-store'});let c=await r.json();"
         "document.getElementById('device_name').value=c.device_name||'';"
         "document.getElementById('wifi_status').textContent=c.wifi_connected?'Connected to Wi-Fi: '+c.current_ssid:'Wi-Fi is not connected. Saved network: '+(c.saved_ssid||'none');"
@@ -1089,14 +1389,28 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "let li=document.getElementById('logs_interval_sec'),bi=document.getElementById('bike_interval_sec');"
         "li.min=c.logs_min_interval_sec||60;bi.min=c.bike_min_interval_sec||10;li.max=bi.max=c.max_interval_sec||3600;"
         "li.value=c.logs_interval_sec||li.min;bi.value=c.bike_interval_sec||bi.min;"
+        "document.getElementById('ha_enabled').checked=!!c.ha_enabled;document.getElementById('ha_host').value=c.ha_host||'';"
+        "document.getElementById('ha_port').value=c.ha_port||1883;document.getElementById('ha_username').value=c.ha_username||'';document.getElementById('ha_password').value='';"
+        "document.getElementById('ha_discovery_prefix').value=c.ha_discovery_prefix||'homeassistant';document.getElementById('ha_topic_base').value=c.ha_topic_base||'boschldi';"
+        "let hi=document.getElementById('ha_interval_sec');hi.min=c.ha_min_interval_sec||2;hi.max=c.ha_max_interval_sec||3600;hi.value=c.ha_interval_sec||5;"
         "document.getElementById('led_enabled').checked=!!c.led_enabled;"
-        "document.getElementById('led_brightness_percent').value=c.led_brightness_percent||80;"
-        "['boot','advertising','connected','secured','ready','activity','error'].forEach(k=>{let v=c['led_'+k+'_color'];if(v)document.getElementById('led_'+k+'_color').value=v})}catch(e){}}"
-        "async function loadHueStatus(){try{let r=await fetch('/api/hue/status',{cache:'no-store'});let j=await r.json();huePaired=!!j.paired;"
+        "document.getElementById('led_brightness_percent').value=c.led_brightness_percent||20;}catch(e){}}"
+        "let hueBridgeCards=[],lastHueDevices={},hueDevicesAvailable=false,hueDevicesCached=false,hueDevicesLoadedAt=0;"
+        "async function loadHueStatus(force){if(!force&&loadHueStatus.last&&Date.now()-loadHueStatus.last<10000)return;try{let r=await fetch('/api/hue/status',{cache:'no-store'});let j=await r.json();loadHueStatus.last=Date.now();huePaired=!!j.paired;"
         "document.getElementById('automation_tab_btn').style.display=huePaired?'block':'none';"
         "document.getElementById('hue_status').textContent=huePaired?'Connected to Hue Bridge: '+bridgeLabel(j):'Hue Bridge is not paired.';"
-        "if(j.bridge_host)document.getElementById('hue_host').value=j.bridge_host}catch(e){document.getElementById('hue_status').textContent='Could not load Hue status'}}"
-        "function bridgeLabel(j){let n=j.bridge_name||j.instance||'';let h=j.bridge_host||j.ip||j.hostname||'';return n?(n+(h?' ('+h+')':'')):(h||'unknown')}"
+        "document.getElementById('hue_discover_btn').style.display=huePaired?'none':'inline-block';if(huePaired)renderPairedHueBridge(j);else if(!hueBridgeCards.length)document.getElementById('hue_cards').innerHTML=''}"
+        "catch(e){huePaired=false;document.getElementById('hue_status').textContent='Could not load Hue status';showToast('Could not load Hue status')}}"
+        "function bridgeLabel(j){let n=j.bridge_name||j.instance||j.name||'';let h=j.bridge_host||j.ip||j.hostname||'';return n?(n+(h?' ('+h+')':'')):(h||'unknown')}"
+        "function bridgeName(j){return j.bridge_name||j.instance||j.name||'Hue Bridge'}function bridgeHost(j){return j.bridge_host||j.ip||j.hostname||''}"
+        "function bridgeCardHtml(b,paired,i){let h=bridgeHost(b),n=bridgeName(b);return '<div class=device><div class=row><h3>'+escapeHtml(n)+'</h3><span class=badge>'+escapeHtml(b.model_id||b.api||'Hue')+'</span></div>'"
+        "+'<div class=muted>'+escapeHtml(h||'No IP reported')+'</div><div>Bridge ID: <code>'+escapeHtml(b.bridge_id||'-')+'</code></div>'"
+        "+(b.hostname?'<div>Hostname: '+escapeHtml(b.hostname)+'</div>':'')+'<div class=actions>'"
+        "+(paired?'<button onclick=showHueDevicesModal()>Show devices</button><button onclick=clearHue()>Disconnect / unpair</button>':'<button onclick=pairHueIndex('+i+')>Pair</button>')+'</div></div>'}"
+        "function renderPairedHueBridge(j){hueBridgeCards=[];document.getElementById('hue_cards').innerHTML=bridgeCardHtml(j,true);document.getElementById('hue_output').textContent='Hue Bridge is paired. Devices are shown from the paired bridge only.'}"
+        "function showToast(msg,type,duration){let root=document.getElementById('toast_root'),d=document.createElement('div');d.className='toast '+(type||'error');d.innerHTML=escapeHtml(msg)+'<button onclick=\"this.parentNode.remove()\">&times;</button>';root.appendChild(d);setTimeout(()=>d.remove(),Math.max(2000,duration||5000))}"
+        "function modalPointerDown(ev){ev.currentTarget.dataset.backdropDown=ev.target===ev.currentTarget?'1':'0'}"
+        "function modalBackdropClick(ev,closeFn){let m=ev.currentTarget;if(ev.target===m&&m.dataset.backdropDown==='1'&&!String(getSelection()).length)closeFn();m.dataset.backdropDown='0'}"
         "function hueDeviceRow(id,d){let reachable=!d.state||d.state.reachable!==false,on=!!(d.state&&d.state.on),plug=(d.type||'').toLowerCase().includes('plug')||(d.productname||'').toLowerCase().includes('plug');"
         "let state=reachable?(on?'On':'Off'):'Unreachable',cls=reachable?(on?'on':'off'):'warn',kind=plug?'Smart plug':(d.productname||d.type||'Light');"
         "let bri=d.state&&d.state.bri!=null?Math.round(d.state.bri/254*100)+'%':'-';"
@@ -1104,42 +1418,69 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "+'<td>'+escapeHtml(kind)+'</td><td><code>'+escapeHtml(id)+'</code></td><td>'+escapeHtml(d.type||'-')+'</td><td>'+bri+'</td><td>'+escapeHtml(d.modelid||'-')+'</td></tr>'}"
         "function escapeHtml(s){let e=document.createElement('div');e.textContent=String(s);return e.innerHTML}"
         "function isPlug(d){return (d.type||'').toLowerCase().includes('plug')||(d.productname||'').toLowerCase().includes('plug')}"
-        "function renderHueDevices(j){let box=document.getElementById('hue_devices'),data=j.data||{},ids=Object.keys(data).sort((a,b)=>isPlug(data[b])-isPlug(data[a])||String(data[a].name||a).localeCompare(String(data[b].name||b)));"
+        "function renderHueDeviceTable(box,j){let data=j.data||{},ids=Object.keys(data).sort((a,b)=>isPlug(data[b])-isPlug(data[a])||String(data[a].name||a).localeCompare(String(data[b].name||b)));"
         "box.innerHTML=ids.length?'<table><thead><tr><th>Name</th><th>State</th><th>Kind</th><th>Hue id</th><th>Type</th><th>Brightness</th><th>Model</th></tr></thead><tbody>'+ids.map(id=>hueDeviceRow(id,data[id])).join('')+'</tbody></table>':'<div class=device>No Hue devices returned by the Bridge.</div>';renderAutomationDeviceOptions(data)}"
-        "function renderAutomationDeviceOptions(data){let s=document.getElementById('auto_light_id');if(!s)return;let ids=Object.keys(data||{}).sort((a,b)=>isPlug(data[b])-isPlug(data[a])||String(data[a].name||a).localeCompare(String(data[b].name||b)));"
-        "s.innerHTML=ids.length?'':'<option value=\"\">No Hue devices loaded</option>';ids.forEach(id=>{let o=document.createElement('option');o.value=id;o.textContent=(data[id].name||('Device '+id))+' (#'+id+')';s.appendChild(o)})}"
-        "async function discoverHue(){let h=document.getElementById('hue_output');h.textContent='Scanning...';"
+        "function renderHueDevices(j){renderHueDeviceTable(document.getElementById('hue_devices_modal'),j)}"
+        "function renderAutomationDeviceOptions(data){lastHueDevices=data||lastHueDevices||{};let ids=Object.keys(lastHueDevices).sort((a,b)=>isPlug(lastHueDevices[b])-isPlug(lastHueDevices[a])||String(lastHueDevices[a].name||a).localeCompare(String(lastHueDevices[b].name||b)));"
+        "document.querySelectorAll('.trig_light_id').forEach(s=>{let old=s.value;s.innerHTML=ids.length?'':'<option value=\"\">No Hue devices loaded</option>';ids.forEach(id=>{let o=document.createElement('option');o.value=id;o.textContent=(lastHueDevices[id].name||('Device '+id))+' (#'+id+')';s.appendChild(o)});if(old&&!lastHueDevices[old]){let o=document.createElement('option');o.value=old;o.textContent='Missing Hue device #'+old;s.appendChild(o)}if(old)s.value=old});updateAutomationWarningFlags()}"
+        "async function discoverHue(){let h=document.getElementById('hue_output'),cards=document.getElementById('hue_cards');h.textContent='Scanning...';cards.innerHTML='';"
         "try{let r=await fetch('/api/hue/bridges',{cache:'no-store'});let j=await r.json();"
-        "if(j.bridges&&j.bridges[0]){document.getElementById('hue_host').value=j.bridges[0].ip||j.bridges[0].hostname||'';"
-        "h.textContent='Found '+bridgeLabel(j.bridges[0])+'\\n\\n'+JSON.stringify(j,null,2)}else h.textContent='No Hue Bridge discovered.'}"
-        "catch(e){h.textContent='Hue discovery failed'}}"
+        "hueBridgeCards=j.bridges||[];cards.innerHTML=hueBridgeCards.length?hueBridgeCards.map((b,i)=>bridgeCardHtml(b,false,i)).join(''):'<div class=device>No Hue Bridge discovered.</div>';"
+        "h.textContent=hueBridgeCards.length?'Found '+hueBridgeCards.length+' Hue Bridge(s).':'No Hue Bridge discovered.';showToast(h.textContent,hueBridgeCards.length?'ok':'error',3000)}"
+        "catch(e){h.textContent='Hue discovery failed';showToast('Hue discovery failed')}}"
         "let huePairTimer=null;"
-        "async function pollHuePair(){let h=document.getElementById('hue_output');try{let r=await fetch('/api/hue/pair/progress',{cache:'no-store'});"
-        "let j=await r.json();h.textContent=JSON.stringify(j,null,2);if(j.paired){huePaired=true;loadHueStatus();loadHueDevices()}if(!j.running&&huePairTimer){clearInterval(huePairTimer);huePairTimer=null}}"
-        "catch(e){h.textContent='Hue pairing progress failed';if(huePairTimer){clearInterval(huePairTimer);huePairTimer=null}}}"
-        "async function startHuePairing(){let h=document.getElementById('hue_output');h.textContent='Press the Hue Bridge button now. The ESP is checking automatically...';"
-        "let b=new URLSearchParams();b.set('bridge_host',document.getElementById('hue_host').value);"
-        "try{let r=await fetch('/api/hue/pair/start',{method:'POST',body:b});let j=await r.json();h.textContent=JSON.stringify(j,null,2);"
-        "if(huePairTimer)clearInterval(huePairTimer);huePairTimer=setInterval(pollHuePair,2000);setTimeout(pollHuePair,600)}"
-        "catch(e){h.textContent='Hue pairing start failed'}}"
-        "async function loadHueDevices(){let h=document.getElementById('hue_output');h.textContent='Loading Hue devices...';"
-        "try{let r=await fetch('/api/hue/devices',{cache:'no-store'});let j=await r.json();renderHueDevices(j);h.textContent='Loaded '+Object.keys(j.data||{}).length+' Hue devices from '+bridgeLabel(j)+'.'}"
-        "catch(e){h.textContent='Hue device load failed'}}"
-        "function ruleHtml(r,i){return '<div class=device><div class=row><h3>Rule '+(i+1)+'</h3><span class=\"badge '+(r.enabled?'on':'off')+'\">'+(r.enabled?'Enabled':'Off')+'</span></div>'"
-        "+'<div>If <strong>'+escapeHtml(r.field)+'</strong> '+escapeHtml(r.op)+' '+Number(r.value).toFixed(3)+'</div>'"
-        "+'<div>Then Hue #'+escapeHtml(r.light_id)+' '+(r.action_on?'on':'off')+'</div><div class=muted>Cooldown '+r.cooldown_sec+'s</div></div>'}"
-        "async function loadAutomation(){if(huePaired)loadHueDevices();let p=document.getElementById('automation_preview'),box=document.getElementById('automation_rules');"
-        "try{let r=await fetch('/api/automation/rules',{cache:'no-store'});let j=await r.json();box.innerHTML=(j.rules||[]).length?j.rules.map(ruleHtml).join(''):'<div class=device>No automation rules yet.</div>';p.textContent='Rules run when new bike data arrives. Boolean fields use 0=false and 1=true.'}"
-        "catch(e){p.textContent='Could not load automation rules'}}"
-        "async function addAutomationRule(ev){ev.preventDefault();let p=document.getElementById('automation_preview'),b=new URLSearchParams();"
-        "['field','op','value','light_id','cooldown_sec'].forEach(k=>b.set(k,document.getElementById('auto_'+k).value));"
-        "b.set('enabled',document.getElementById('auto_enabled').checked?'1':'');b.set('action_on',document.getElementById('auto_action_on').value);"
-        "try{let r=await fetch('/api/automation/rule',{method:'POST',body:b});let j=await r.json();p.textContent=JSON.stringify(j,null,2);loadAutomation()}catch(e){p.textContent='Rule save failed'}return false}"
-        "async function clearAutomationRules(){let p=document.getElementById('automation_preview');try{let r=await fetch('/api/automation/clear',{method:'POST'});let j=await r.json();p.textContent=JSON.stringify(j,null,2);loadAutomation()}catch(e){p.textContent='Rule clear failed'}}"
+        "function openPairModal(name,host){document.getElementById('pair_modal').classList.add('open');document.getElementById('pair_msg').textContent='Please press the button on Hue Bridge '+name+' ('+host+').';document.getElementById('pair_meta').textContent='Waiting for Bridge authorization...'}"
+        "function closePairModal(){document.getElementById('pair_modal').classList.remove('open')}"
+        "async function pollHuePair(){try{let r=await fetch('/api/hue/pair/progress',{cache:'no-store'});let j=await r.json();"
+        "document.getElementById('pair_meta').textContent='Attempt '+(j.attempt||0)+' / '+(j.max_attempts||30);document.getElementById('hue_output').textContent=JSON.stringify(j,null,2);"
+        "if(j.paired){if(huePairTimer)clearInterval(huePairTimer);huePairTimer=null;closePairModal();huePaired=true;showToast('Hue Bridge paired','ok',3000);await loadHueStatus();return}"
+        "if(!j.running){if(huePairTimer)clearInterval(huePairTimer);huePairTimer=null;closePairModal();showToast((j.last&&j.last.error)||'Hue pairing failed')}}"
+        "catch(e){if(huePairTimer)clearInterval(huePairTimer);huePairTimer=null;closePairModal();showToast('Hue pairing progress failed')}}"
+        "async function startHuePairing(host,name){let h=document.getElementById('hue_output');openPairModal(name||'Hue Bridge',host||'auto');let b=new URLSearchParams();b.set('bridge_host',host||'');"
+        "try{let r=await fetch('/api/hue/pair/start',{method:'POST',body:b});let j=await r.json();h.textContent=JSON.stringify(j,null,2);if(j.error){closePairModal();showToast(j.error);return}"
+        "if(j.paired){closePairModal();huePaired=true;showToast('Hue Bridge already paired','ok',3000);loadHueStatus();return}if(huePairTimer)clearInterval(huePairTimer);huePairTimer=setInterval(pollHuePair,2000);setTimeout(pollHuePair,600)}"
+        "catch(e){closePairModal();showToast('Hue pairing start failed')}}"
+        "function pairHueIndex(i){let b=hueBridgeCards[i]||{};startHuePairing(bridgeHost(b),bridgeName(b))}"
+        "async function cancelHuePairing(){try{await fetch('/api/hue/pair/cancel',{method:'POST'});}catch(e){}if(huePairTimer)clearInterval(huePairTimer);huePairTimer=null;closePairModal();showToast('Hue pairing canceled')}"
+        "async function loadHueDevices(force){if(!force&&Object.keys(lastHueDevices||{}).length&&Date.now()-hueDevicesLoadedAt<30000)return {data:lastHueDevices,available:hueDevicesAvailable,cached:hueDevicesCached};let h=document.getElementById('hue_output');h.textContent='Loading Hue devices...';"
+        "try{let r=await fetch('/api/hue/devices',{cache:'no-store'});let j=await r.json();hueDevicesAvailable=!!j.available;hueDevicesCached=!!j.cached;hueDevicesLoadedAt=Date.now();renderHueDevices(j);let n=Object.keys(j.data||{}).length;h.textContent=(hueDevicesAvailable?'Loaded ':'Using cached ')+n+' Hue devices from '+bridgeLabel(j)+(hueDevicesAvailable?'.':' - bridge not currently available.');if(!hueDevicesAvailable)showToast('Hue Bridge/devices not currently available; using cached devices','error',5000);updateAutomationWarningFlags();return j}"
+        "catch(e){hueDevicesAvailable=false;hueDevicesCached=Object.keys(lastHueDevices||{}).length>0;h.textContent=hueDevicesCached?'Hue device refresh failed; using browser cache.':'Hue device load failed';showToast(h.textContent,'error');updateAutomationWarningFlags();return {data:lastHueDevices,available:false,cached:hueDevicesCached}}}"
+        "async function showHueDevicesModal(){document.getElementById('devices_modal').classList.add('open');await loadHueDevices()}"
+        "function closeHueDevicesModal(){document.getElementById('devices_modal').classList.remove('open')}"
+        "const bikeFields=[['speed_kmh','Speed km/h','Current bike speed in kilometres per hour.'],['cadence_rpm','Cadence rpm','Pedalling cadence.'],['rider_power_w','Rider power W','Rider power contribution in watts.'],['ambient_brightness_lux','Ambient brightness lux','Brightness measured by the bike system.'],['battery_soc','Battery %','Main battery state of charge.'],['odometer_m','Odometer m','Total distance in metres.'],['bike_light','Bike light','1 means off, 2 means on.'],['system_locked','System locked','1 means the bike reports locked.'],['charger_connected','Charger connected','1 means charger connected.'],['light_reserve_state','Light reserve','Bike light reserve state as numeric value.'],['diagnosis_program_active','Diagnosis active','1 means diagnostic mode active.'],['bike_not_driving','Bike not moving','1 means the bike reports not driving.']];"
+        "function fieldOptions(){return bikeFields.map(f=>'<option value=\"'+f[0]+'\">'+f[1]+'</option>').join('')}"
+        "function updateFieldHelp(sel){let f=bikeFields.find(x=>x[0]==sel.value);document.getElementById('auto_field_help').textContent=f?f[1]+': '+f[2]:'Select a bike field.'}"
+        "function conditionHtml(c){return '<strong>'+escapeHtml(c.field)+'</strong> '+escapeHtml(c.op)+' '+Number(c.value).toFixed(3)}"
+        "function triggerText(t){let d=(lastHueDevices||{})[t.light_id]||{};let name=d.name?escapeHtml(d.name)+' ':'';return name+'Hue #'+escapeHtml(t.light_id)+' '+(t.action_on?'on':'off')}"
+        "function groupHtml(g){let cs=g.conditions||[];return '('+cs.map(conditionHtml).join(' '+escapeHtml(g.condition_logic||'AND')+' ')+')'}"
+        "let automationRules=[],editingAutomationIndex=-1;"
+        "function hueReady(){return !!(huePaired&&hueDevicesAvailable&&Object.keys(lastHueDevices||{}).length)}"
+        "function ruleTriggers(r){return (r.triggers&&r.triggers.length)?r.triggers:[{light_id:r.light_id,action_on:r.action_on}]}"
+        "function ruleMissingDevices(r){return ruleTriggers(r).filter(t=>t.light_id&&!lastHueDevices[t.light_id]).map(t=>t.light_id)}"
+        "function updateAutomationWarningFlags(){let missing=(automationRules||[]).some(r=>ruleMissingDevices(r).length);let b=document.getElementById('automation_tab_btn');if(b)b.classList.toggle('warnflag',missing);return missing}"
+        "function ruleRowHtml(r,i){let cs=(r.conditions&&r.conditions.length)?r.conditions:[r],groups=r.groups||null,ts=ruleTriggers(r),missing=ruleMissingDevices(r);let detail=groups?groups.map(groupHtml).join(' '+escapeHtml(r.group_logic||'AND')+' '):cs.map(conditionHtml).join(' '+escapeHtml(r.condition_logic||'AND')+' ');let ok=hueReady(),tip=' title=\"Hue Bridge and devices not currently available\"';return '<tr class=\"'+(missing.length?'rulewarn':'')+'\"><td><strong>'+escapeHtml(r.name||('Automation '+(i+1)))+'</strong><div class=muted>'+detail+'</div><div class=muted>'+ts.map(triggerText).join(', ')+'</div></td><td><span class=\"badge '+(r.enabled?'on':'off')+'\">'+(r.enabled?'Enabled':'Disabled')+'</span>'+(missing.length?' <span class=\"badge warn\">Device missing</span>':'')+'</td><td><div class=rowactions><button class=iconbtn '+(ok?'title=Edit aria-label=Edit onclick=editAutomation('+i+')':'disabled'+tip+' aria-label=Edit')+'>&#9998;</button><button class=iconbtn '+(ok?'title=Test aria-label=Test onclick=testAutomation('+i+')':'disabled'+tip+' aria-label=Test')+'>&#9654;</button><button class=iconbtn title=\"'+(r.enabled?'Disable':'Enable')+'\" aria-label=\"'+(r.enabled?'Disable':'Enable')+'\" onclick=toggleAutomation('+i+','+(!r.enabled)+')>&#9211;</button><button class=\"iconbtn danger\" title=Delete aria-label=Delete onclick=deleteAutomation('+i+')>&times;</button></div></td></tr>'}"
+        "async function ensureHueDevicesLoaded(force){if(!huePaired)await loadHueStatus(force);if(huePaired&&(force||!Object.keys(lastHueDevices||{}).length||Date.now()-hueDevicesLoadedAt>30000))await loadHueDevices(force);return hueReady()}"
+        "async function loadAutomation(){await ensureHueDevicesLoaded(false);let p=document.getElementById('automation_preview'),box=document.getElementById('automation_rules');"
+        "try{let r=await fetch('/api/automation/rules',{cache:'no-store'});let j=await r.json();automationRules=j.rules||[];let warn=updateAutomationWarningFlags();box.innerHTML=automationRules.length?'<table><thead><tr><th>Name</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+automationRules.map(ruleRowHtml).join('')+'</tbody></table>':'<div class=device>No automation rules yet.</div>';let note=hueReady()?'Hue Bridge and devices are reachable.':'Hue Bridge and devices not currently available. Automations can be enabled, disabled, or deleted, but editing and trigger tests are disabled.';p.textContent='Up to '+(j.max_rules||6)+' automations. Conditions can be connected with AND or OR. '+note+(warn?' One or more automations reference Hue devices that are no longer available.':'')}"
+        "catch(e){p.textContent='Could not load automation rules';showToast('Could not load automation rules','error')}}"
+        "function conditionRowHtml(value){return '<div class=\"device cond_row\"><label>Bike field</label><select class=cond_field onchange=updateFieldHelp(this)>'+fieldOptions()+'</select><label>Operator</label><select class=cond_op><option>&lt;</option><option>&lt;=</option><option>==</option><option>&gt;=</option><option>&gt;</option></select><label>Value</label><input class=cond_value type=number step=0.001 value=\"'+(value??1)+'\"><button class=\"iconbtn danger\" title=\"Remove condition\" aria-label=\"Remove condition\" type=button onclick=\"this.parentNode.remove()\">&times;</button></div>'}"
+        "function addConditionRow(btn,field,op,value){let group=btn.closest('.cond_group'),wrap=group.querySelector('.cond_rows'),d=document.createElement('div');d.innerHTML=conditionRowHtml(value);let row=d.firstChild;wrap.appendChild(row);let fs=row.querySelector('.cond_field'),os=row.querySelector('.cond_op');fs.value=field||'battery_soc';os.value=op||'<';updateFieldHelp(fs)}"
+        "function addConditionGroup(logic,conditions){let box=document.getElementById('auto_groups'),g=document.createElement('div');g.className='device cond_group';g.innerHTML='<div class=row><h3>Condition group</h3><button class=\"iconbtn danger\" title=\"Remove group\" aria-label=\"Remove group\" type=button onclick=\"this.closest(\\'.cond_group\\').remove()\">&times;</button></div><label>Connect conditions in this group</label><select class=group_condition_logic><option value=AND>All conditions must match</option><option value=OR>Any condition may match</option></select><div class=cond_rows></div><button type=button onclick=addConditionRow(this)>Add condition</button>';box.appendChild(g);g.querySelector('.group_condition_logic').value=logic||'AND';let add=g.querySelector('button[onclick^=addConditionRow]');(conditions&&conditions.length?conditions:[null]).forEach(c=>c?addConditionRow(add,c.field,c.op,c.value):addConditionRow(add))}"
+        "function addTriggerRow(lightId,on){let box=document.getElementById('auto_triggers'),d=document.createElement('div');d.className='device trigger_row';d.innerHTML='<label>Hue device</label><select class=trig_light_id></select><label>Mode</label><select class=trig_action_on><option value=true>Turn on</option><option value=false>Turn off</option></select><button class=\"iconbtn danger\" title=\"Remove trigger\" aria-label=\"Remove trigger\" type=button onclick=\"this.parentNode.remove()\">&times;</button>';box.appendChild(d);renderAutomationDeviceOptions(lastHueDevices||{});d.querySelector('.trig_light_id').value=lightId||'';d.querySelector('.trig_action_on').value=on===false?'false':'true'}"
+        "async function openAutomationModal(index){if(!await ensureHueDevicesLoaded(false)){showToast('Hue Bridge and devices not currently available','error',5000);return}editingAutomationIndex=Number.isInteger(index)?index:-1;let r=editingAutomationIndex>=0?automationRules[editingAutomationIndex]:null;document.getElementById('auto_groups').innerHTML='';document.getElementById('auto_triggers').innerHTML='';document.getElementById('auto_modal_title').textContent=r?'Edit automation':'New automation';document.getElementById('auto_name').value=(r&&r.name)||'New automation';document.getElementById('auto_group_logic').value=(r&&r.group_logic)||'AND';document.getElementById('auto_cooldown_sec').value=(r&&r.cooldown_sec)||30;document.getElementById('auto_enabled').checked=r?r.enabled!==false:true;let groups=r&&r.groups?r.groups:[{condition_logic:(r&&r.condition_logic)||'AND',conditions:r?((r.conditions&&r.conditions.length)?r.conditions:[{field:r.field,op:r.op,value:r.value}]):[{field:'battery_soc',op:'<',value:35}]}];groups.forEach(g=>addConditionGroup(g.condition_logic,g.conditions));let first=document.querySelector('.cond_row .cond_field');if(first)updateFieldHelp(first);let ts=r&&r.triggers?r.triggers:(r?[{light_id:r.light_id,action_on:r.action_on}]:[{}]);ts.forEach(t=>addTriggerRow(t.light_id,t.action_on));document.getElementById('automation_modal').classList.add('open')}"
+        "async function editAutomation(i){await openAutomationModal(i)}"
+        "function closeAutomationModal(){document.getElementById('automation_modal').classList.remove('open');editingAutomationIndex=-1}"
+        "async function saveAutomationModal(ev){ev.preventDefault();let p=document.getElementById('automation_preview');let groups=[...document.querySelectorAll('#auto_groups .cond_group')].map(g=>({condition_logic:g.querySelector('.group_condition_logic').value,conditions:[...g.querySelectorAll('.cond_row')].map(d=>({field:d.querySelector('.cond_field').value,op:d.querySelector('.cond_op').value,value:Number(d.querySelector('.cond_value').value)}))})).filter(g=>g.conditions.length);let triggers=[...document.querySelectorAll('#auto_triggers .device')].map(d=>({light_id:d.querySelector('.trig_light_id').value,action_on:d.querySelector('.trig_action_on').value=='true'})).filter(t=>t.light_id);if(!groups.length||!triggers.length){showToast('Add at least one condition group and one trigger','error');return false}let payload={name:document.getElementById('auto_name').value||'Automation',enabled:document.getElementById('auto_enabled').checked,group_logic:document.getElementById('auto_group_logic').value,groups,triggers,cooldown_sec:Number(document.getElementById('auto_cooldown_sec').value||30)};let edit=editingAutomationIndex>=0,url=edit?('/api/automation/rule/update?index='+editingAutomationIndex):'/api/automation/rule';try{let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});let j=await r.json();p.textContent=JSON.stringify(j,null,2);if(!r.ok||j.saved===false||j.updated===false)throw new Error(j.error||'save failed');closeAutomationModal();showToast(edit?'Automation updated':'Automation saved','ok',3000);loadAutomation()}catch(e){p.textContent='Automation save failed';showToast('Automation save failed: '+e.message,'error')}return false}"
+        "async function toggleAutomation(i,on){let p=document.getElementById('automation_preview'),b=new URLSearchParams();b.set('index',i);b.set('enabled',on?'1':'0');try{let r=await fetch('/api/automation/rule/enabled',{method:'POST',body:b});let j=await r.json();p.textContent=JSON.stringify(j,null,2);if(!r.ok||j.updated===false)throw new Error(j.error||'update failed');showToast(on?'Automation enabled':'Automation disabled','ok',3000);loadAutomation()}catch(e){showToast('Automation update failed: '+e.message,'error')}}"
+        "async function testAutomation(i){if(!await ensureHueDevicesLoaded(false)){showToast('Hue Bridge and devices not currently available','error',5000);return}let p=document.getElementById('automation_preview'),b=new URLSearchParams();b.set('index',i);try{let r=await fetch('/api/automation/rule/test',{method:'POST',body:b});let j=await r.json();p.textContent=JSON.stringify(j,null,2);if(!r.ok||j.tested===false)throw new Error(j.error||'test failed');showToast('Automation triggers tested','ok',3000)}catch(e){showToast('Automation trigger test failed: '+e.message,'error',5000)}}"
+        "async function deleteAutomation(i){if(!confirm('Delete this automation?'))return;let p=document.getElementById('automation_preview'),b=new URLSearchParams();b.set('index',i);try{let r=await fetch('/api/automation/rule/delete',{method:'POST',body:b});let j=await r.json();p.textContent=JSON.stringify(j,null,2);if(!r.ok||j.deleted===false)throw new Error(j.error||'delete failed');showToast('Automation deleted','ok',3000);loadAutomation()}catch(e){showToast('Automation delete failed: '+e.message,'error')}}"
+        "async function addDefaultAutomationRule(){let p=document.getElementById('automation_preview');if(!await ensureHueDevicesLoaded(false)){showToast('Hue Bridge and devices not currently available','error',5000);return false}let ids=Object.keys(lastHueDevices||{}).sort((a,b)=>isPlug(lastHueDevices[b])-isPlug(lastHueDevices[a])||String(lastHueDevices[a].name||a).localeCompare(String(lastHueDevices[b].name||b))),id=ids[0]||'';if(!id){showToast('No Hue devices loaded','error',5000);return false}"
+        "let b=new URLSearchParams();b.set('light_id',id);try{let r=await fetch('/api/automation/default',{method:'POST',body:b});let j=await r.json();p.textContent=JSON.stringify(j,null,2);showToast('Example automation rule saved','ok',3000);loadAutomation()}catch(e){p.textContent='Example rule save failed';showToast('Example rule save failed','error')}return false}"
+        "async function clearAutomationRules(){let p=document.getElementById('automation_preview');try{let r=await fetch('/api/automation/clear',{method:'POST'});let j=await r.json();p.textContent=JSON.stringify(j,null,2);showToast('Automation rules cleared','ok',3000);loadAutomation()}catch(e){p.textContent='Rule clear failed';showToast('Rule clear failed','error')}}"
         "async function clearHue(){let h=document.getElementById('hue_output');h.textContent='Clearing Hue pairing...';"
-        "try{let r=await fetch('/api/hue/clear',{method:'POST'});let j=await r.json();h.textContent=JSON.stringify(j,null,2);huePaired=false;document.getElementById('automation_tab_btn').style.display='none';document.getElementById('hue_devices').innerHTML=''}"
-        "catch(e){h.textContent='Hue pairing clear failed'}}"
-        "load();loadConfig();loadHueStatus();setInterval(load,3000)</script>"
+        "try{let r=await fetch('/api/hue/clear',{method:'POST'});let j=await r.json();h.textContent=JSON.stringify(j,null,2);huePaired=false;hueBridgeCards=[];lastHueDevices={};hueDevicesAvailable=false;hueDevicesCached=false;hueDevicesLoadedAt=0;document.getElementById('automation_tab_btn').style.display='none';document.getElementById('hue_discover_btn').style.display='inline-block';document.getElementById('hue_cards').innerHTML='';document.getElementById('hue_devices_modal').innerHTML='';showToast('Hue Bridge disconnected','ok',3000)}"
+        "catch(e){h.textContent='Hue pairing clear failed';showToast('Hue pairing clear failed')}}"
+        "showTab(currentTab(),false);load();loadConfig();loadHueStatus();setInterval(load,3000)</script>"
         "</body></html>";
 
     httpd_resp_set_type(req, "text/html");
@@ -1343,6 +1684,79 @@ static esp_err_t export_config_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "Export configuration saved.");
 }
 
+static esp_err_t ha_config_post_handler(httpd_req_t *req)
+{
+    char body[512] = {0};
+    int total = req->content_len;
+    if (total <= 0 || total >= (int)sizeof(body)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Invalid form");
+    }
+
+    int read_len = httpd_req_recv(req, body, total);
+    if (read_len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Could not read form");
+    }
+    body[read_len] = '\0';
+
+    accessory_ha_config_t existing = {0};
+    accessory_config_load_ha(&existing);
+
+    accessory_ha_config_t config = {0};
+    char enabled[4];
+    char port[8];
+    char password[ACCESSORY_HA_PASSWORD_MAX_LEN + 1];
+    char interval[12];
+    form_value(body, "ha_enabled", enabled, sizeof(enabled));
+    form_value(body, "ha_host", config.host, sizeof(config.host));
+    form_value(body, "ha_port", port, sizeof(port));
+    form_value(body, "ha_username", config.username, sizeof(config.username));
+    form_value(body, "ha_password", password, sizeof(password));
+    form_value(body, "ha_discovery_prefix", config.discovery_prefix,
+               sizeof(config.discovery_prefix));
+    form_value(body, "ha_topic_base", config.topic_base, sizeof(config.topic_base));
+    form_value(body, "ha_interval_sec", interval, sizeof(interval));
+
+    config.enabled = enabled[0] != '\0';
+    config.port = (uint16_t)strtoul(port, NULL, 10);
+    if (config.port == 0) {
+        config.port = ACCESSORY_HA_DEFAULT_PORT;
+    }
+    if (password[0] != '\0') {
+        strlcpy(config.password, password, sizeof(config.password));
+    } else {
+        strlcpy(config.password, existing.password, sizeof(config.password));
+    }
+    if (config.discovery_prefix[0] == '\0') {
+        strlcpy(config.discovery_prefix, ACCESSORY_HA_DEFAULT_DISCOVERY_PREFIX,
+                sizeof(config.discovery_prefix));
+    }
+    if (config.topic_base[0] == '\0') {
+        strlcpy(config.topic_base, ACCESSORY_HA_DEFAULT_TOPIC_BASE, sizeof(config.topic_base));
+    }
+    config.interval_sec = accessory_config_clamp_ha_interval((uint32_t)strtoul(interval, NULL, 10));
+
+    if (!accessory_config_ha_is_valid(&config) ||
+        (config.enabled && config.host[0] == '\0')) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "MQTT host, username, password, prefix, and topic must be printable tokens without spaces.");
+    }
+
+    esp_err_t err = accessory_config_save_ha(&config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Home Assistant config save failed; err=%s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "Home Assistant configuration save failed");
+    }
+
+    persistent_log_event("info", "home_assistant",
+                         "config saved enabled=%u host_set=%u interval_sec=%u",
+                         config.enabled, config.host[0] != '\0', (unsigned)config.interval_sec);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "Home Assistant MQTT configuration saved.");
+}
+
 static esp_err_t led_config_post_handler(httpd_req_t *req)
 {
     char body[512] = {0};
@@ -1360,6 +1774,7 @@ static esp_err_t led_config_post_handler(httpd_req_t *req)
     body[read_len] = '\0';
 
     accessory_led_config_t config = {0};
+    accessory_config_load_led(&config);
     char enabled[4];
     char brightness[8];
     char boot_color[8];
@@ -1381,13 +1796,13 @@ static esp_err_t led_config_post_handler(httpd_req_t *req)
 
     config.enabled = enabled[0] != '\0';
     config.brightness_percent = accessory_config_clamp_led_brightness((uint32_t)strtoul(brightness, NULL, 10));
-    if (!parse_color_hex(boot_color, &config.boot_color) ||
-        !parse_color_hex(advertising_color, &config.advertising_color) ||
-        !parse_color_hex(connected_color, &config.connected_color) ||
-        !parse_color_hex(secured_color, &config.secured_color) ||
-        !parse_color_hex(ready_color, &config.ready_color) ||
-        !parse_color_hex(activity_color, &config.activity_color) ||
-        !parse_color_hex(error_color, &config.error_color)) {
+    if ((boot_color[0] != '\0' && !parse_color_hex(boot_color, &config.boot_color)) ||
+        (advertising_color[0] != '\0' && !parse_color_hex(advertising_color, &config.advertising_color)) ||
+        (connected_color[0] != '\0' && !parse_color_hex(connected_color, &config.connected_color)) ||
+        (secured_color[0] != '\0' && !parse_color_hex(secured_color, &config.secured_color)) ||
+        (ready_color[0] != '\0' && !parse_color_hex(ready_color, &config.ready_color)) ||
+        (activity_color[0] != '\0' && !parse_color_hex(activity_color, &config.activity_color)) ||
+        (error_color[0] != '\0' && !parse_color_hex(error_color, &config.error_color))) {
         httpd_resp_set_status(req, "400 Bad Request");
         return httpd_resp_sendstr(req, "LED colors must be #RRGGBB values.");
     }
@@ -1415,7 +1830,7 @@ static esp_err_t start_http_server(bool setup_mode)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.stack_size = 8192;
-    config.max_uri_handlers = 34;
+    config.max_uri_handlers = 48;
     config.uri_match_fn = httpd_uri_match_wildcard;
 
     ESP_RETURN_ON_ERROR(httpd_start(&http_server, &config), TAG, "HTTP start failed");
@@ -1483,6 +1898,41 @@ static esp_err_t start_http_server(bool setup_mode)
     };
     httpd_register_uri_handler(http_server, &api_automation_rule);
 
+    const httpd_uri_t api_automation_rule_update = {
+        .uri = "/api/automation/rule/update",
+        .method = HTTP_POST,
+        .handler = api_automation_rule_update_post_handler,
+    };
+    httpd_register_uri_handler(http_server, &api_automation_rule_update);
+
+    const httpd_uri_t api_automation_rule_enabled = {
+        .uri = "/api/automation/rule/enabled",
+        .method = HTTP_POST,
+        .handler = api_automation_rule_enabled_post_handler,
+    };
+    httpd_register_uri_handler(http_server, &api_automation_rule_enabled);
+
+    const httpd_uri_t api_automation_rule_delete = {
+        .uri = "/api/automation/rule/delete",
+        .method = HTTP_POST,
+        .handler = api_automation_rule_delete_post_handler,
+    };
+    httpd_register_uri_handler(http_server, &api_automation_rule_delete);
+
+    const httpd_uri_t api_automation_rule_test = {
+        .uri = "/api/automation/rule/test",
+        .method = HTTP_POST,
+        .handler = api_automation_rule_test_post_handler,
+    };
+    httpd_register_uri_handler(http_server, &api_automation_rule_test);
+
+    const httpd_uri_t api_automation_default = {
+        .uri = "/api/automation/default",
+        .method = HTTP_POST,
+        .handler = api_automation_default_post_handler,
+    };
+    httpd_register_uri_handler(http_server, &api_automation_default);
+
     const httpd_uri_t api_automation_clear = {
         .uri = "/api/automation/clear",
         .method = HTTP_POST,
@@ -1524,6 +1974,13 @@ static esp_err_t start_http_server(bool setup_mode)
         .handler = api_hue_pair_progress_get_handler,
     };
     httpd_register_uri_handler(http_server, &api_hue_pair_progress);
+
+    const httpd_uri_t api_hue_pair_cancel = {
+        .uri = "/api/hue/pair/cancel",
+        .method = HTTP_POST,
+        .handler = api_hue_pair_cancel_post_handler,
+    };
+    httpd_register_uri_handler(http_server, &api_hue_pair_cancel);
 
     const httpd_uri_t api_hue_devices = {
         .uri = "/api/hue/devices",
@@ -1587,6 +2044,11 @@ static esp_err_t start_http_server(bool setup_mode)
         .method = HTTP_POST,
         .handler = export_config_post_handler,
     };
+    const httpd_uri_t ha_config = {
+        .uri = "/ha-config",
+        .method = HTTP_POST,
+        .handler = ha_config_post_handler,
+    };
     const httpd_uri_t led_config = {
         .uri = "/led-config",
         .method = HTTP_POST,
@@ -1596,6 +2058,7 @@ static esp_err_t start_http_server(bool setup_mode)
     httpd_register_uri_handler(http_server, &save);
     httpd_register_uri_handler(http_server, &device_name);
     httpd_register_uri_handler(http_server, &export_config);
+    httpd_register_uri_handler(http_server, &ha_config);
     httpd_register_uri_handler(http_server, &led_config);
 
     if (!setup_mode) {
