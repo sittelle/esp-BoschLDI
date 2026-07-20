@@ -52,7 +52,6 @@ esp_err_t automation_update_rule_json(uint8_t index, const char *rule_json, char
 esp_err_t automation_set_rule_enabled(uint8_t index, bool enabled, char *out, size_t out_len);
 esp_err_t automation_delete_rule(uint8_t index, char *out, size_t out_len);
 esp_err_t automation_test_rule_triggers(uint8_t index, char *out, size_t out_len);
-esp_err_t automation_add_default_low_battery_rule(const char *light_id, char *out, size_t out_len);
 esp_err_t automation_clear_rules(char *out, size_t out_len);
 esp_err_t automation_start(void);
 void automation_request_evaluate(uint32_t changed_fields);

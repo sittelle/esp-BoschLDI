@@ -37,6 +37,7 @@ if ([string]::IsNullOrWhiteSpace($Port)) {
 
 $buildScript = Join-Path $root "tools\pio-build.ps1"
 $uploadScript = Join-Path $root "tools\pio-upload.ps1"
+$runAppScript = Join-Path $root "tools\esp-run-app.ps1"
 if (!(Test-Path $buildScript)) {
     throw "Missing build helper: $buildScript"
 }
@@ -71,6 +72,11 @@ Write-Step "Flashing firmware"
     -Configure:$Configure
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
+}
+
+if (Test-Path $runAppScript) {
+    Write-Step "Releasing BOOT line and resetting into app"
+    & $runAppScript -Port $Port
 }
 
 if ($NoVerify) {

@@ -1045,32 +1045,6 @@ esp_err_t automation_test_rule_triggers(uint8_t index, char *out, size_t out_len
     return ok ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t automation_add_default_low_battery_rule(const char *light_id, char *out, size_t out_len)
-{
-    automation_rule_t rule = {
-        .enabled = true,
-        .condition_count = 3,
-        .trigger_count = 1,
-        .action_on = true,
-        .cooldown_sec = 300,
-    };
-    strlcpy(rule.name, "Low battery smart plug", sizeof(rule.name));
-    strlcpy(rule.conditions[0].field, "battery_soc", sizeof(rule.conditions[0].field));
-    strlcpy(rule.conditions[0].op, "<", sizeof(rule.conditions[0].op));
-    rule.conditions[0].value = 35.0;
-    strlcpy(rule.conditions[1].field, "battery_soc", sizeof(rule.conditions[1].field));
-    strlcpy(rule.conditions[1].op, "<", sizeof(rule.conditions[1].op));
-    rule.conditions[1].value = 70.0;
-    strlcpy(rule.conditions[2].field, "bike_not_driving", sizeof(rule.conditions[2].field));
-    strlcpy(rule.conditions[2].op, "==", sizeof(rule.conditions[2].op));
-    rule.conditions[2].value = 1.0;
-    strlcpy(rule.light_id, light_id, sizeof(rule.light_id));
-    strlcpy(rule.triggers[0].light_id, light_id, sizeof(rule.triggers[0].light_id));
-    rule.triggers[0].action_on = true;
-    sync_primary_condition(&rule);
-    return automation_add_rule(&rule, out, out_len);
-}
-
 esp_err_t automation_clear_rules(char *out, size_t out_len)
 {
     esp_err_t err = save_rules_text("[]");

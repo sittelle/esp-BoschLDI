@@ -236,9 +236,6 @@ Configuration endpoints use `application/x-www-form-urlencoded` form bodies:
   - `action_on`: `true`, `1`, or `on` turns on; any other value turns off
   - `cooldown_sec`: clamped to 5-3600
   - Stored JSON may also contain up to 3 `conditions` entries. All conditions are combined with AND.
-- `POST /api/automation/default`
-  - `light_id`: numeric Hue v1 light id from `/api/hue/devices`
-  - Adds the built-in example rule: `battery_soc < 35` AND `battery_soc < 70` AND `bike_not_driving == 1`, then turn the selected Hue smart plug/device on.
 - `POST /api/automation/clear`
   - Clears all stored automation rules
 - `POST /api/hue/clear`

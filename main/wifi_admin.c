@@ -894,41 +894,6 @@ static esp_err_t api_automation_rule_test_post_handler(httpd_req_t *req)
     return err;
 }
 
-static esp_err_t api_automation_default_post_handler(httpd_req_t *req)
-{
-    char body[96] = {0};
-    if (req->content_len <= 0 || req->content_len >= (int)sizeof(body)) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_sendstr(req, "{\"error\":\"Invalid form\"}");
-    }
-
-    int read_len = httpd_req_recv(req, body, req->content_len);
-    if (read_len <= 0) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_sendstr(req, "{\"error\":\"Could not read form\"}");
-    }
-    body[read_len] = '\0';
-
-    char light_id[AUTOMATION_LIGHT_ID_MAX_LEN + 1];
-    form_value(body, "light_id", light_id, sizeof(light_id));
-
-    char *response = malloc(WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
-    if (response == NULL) {
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_sendstr(req, "{\"error\":\"automation response allocation failed\"}");
-    }
-
-    esp_err_t err = automation_add_default_low_battery_rule(
-        light_id, response, WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
-    httpd_resp_set_type(req, "application/json");
-    if (err != ESP_OK) {
-        httpd_resp_set_status(req, "400 Bad Request");
-    }
-    err = httpd_resp_sendstr(req, response);
-    free(response);
-    return err;
-}
-
 static esp_err_t api_automation_clear_post_handler(httpd_req_t *req)
 {
     char *response = malloc(WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE);
@@ -1201,6 +1166,7 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         ".device{background:#fff;border:1px solid #d8dde2;border-radius:6px;padding:12px;display:grid;gap:7px}"
         ".device h3{font-size:16px;margin:0}.row{display:flex;justify-content:space-between;gap:10px;align-items:center}"
         ".cond_row{grid-template-columns:minmax(180px,1fr) 86px minmax(110px,160px) auto;align-items:end}.trigger_row{grid-template-columns:minmax(220px,1fr) 140px auto;align-items:end}.cond_row label,.trigger_row label{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}.cond_row button,.trigger_row button{margin:0}"
+        ".logicbar{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#eef5fa;border:1px solid #c9dce9;border-radius:6px}.logicbar select{max-width:260px}.logicchip{display:inline-grid;place-items:center;min-width:44px;height:26px;padding:0 9px;border-radius:999px;background:#1769aa;color:#fff;font-weight:800;font-size:12px;letter-spacing:.5px}.rule_canvas{display:grid;gap:12px}.cond_group{position:relative;border-color:#b8d0e2;background:#fbfdff;padding:0;overflow:hidden}.cond_group::before{content:'';position:absolute;left:19px;top:48px;bottom:18px;border-left:2px solid #b8d0e2}.group_head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;background:#eef5fa;border-bottom:1px solid #d7e5ef}.group_head h3{font-size:15px}.group_logic{display:flex;align-items:center;gap:8px}.group_logic select{width:auto;min-width:180px}.cond_rows{display:grid;gap:10px;padding:12px 12px 12px 44px}.cond_row{position:relative;background:#fff}.cond_row::before{content:'';position:absolute;left:-25px;top:50%;width:18px;border-top:2px solid #b8d0e2}.cond_row:not(:first-child)::after{content:attr(data-logic);position:absolute;left:-42px;top:-18px;background:#1769aa;color:#fff;border-radius:999px;font-size:11px;font-weight:800;padding:2px 6px}.cond_group_add{margin:0 12px 12px 44px}"
         ".muted{color:#666}.badge{font-size:12px;border-radius:999px;padding:2px 8px;background:#edf0f2;color:#333;white-space:nowrap}"
         ".on{background:#d7f4df;color:#125d25}.off{background:#eceff1;color:#4d555c}.warn{background:#ffe8c2;color:#6b4200}.rulewarn{border-left:4px solid #d18b00}.warntext{color:#6b4200;font-weight:600}"
         ".plan{background:#fff;border-left:4px solid #1769aa;padding:12px 14px;margin:10px 0 16px}"
@@ -1224,8 +1190,8 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "pre{white-space:pre-wrap;background:#111;color:#e8e8e8;"
         "padding:14px;border-radius:6px;overflow:auto;font:13px/1.45 ui-monospace,Consolas,monospace}"
         "#latest{min-height:42px;background:#fff;color:#171717;border:1px solid #ddd}"
-        "#log{height:58vh;margin-top:0}"
-        "@media(max-width:760px){:root{--header-h:66px;--nav-h:48px;--footer-h:28px}.tools{grid-template-columns:1fr 1fr}.check{align-self:center}.formline{grid-template-columns:1fr}.sidebar-layout{display:grid;grid-template-rows:auto minmax(0,1fr);grid-template-columns:1fr}.sidebar{display:flex;gap:6px;overflow:auto;margin-bottom:12px}.sidebar button{white-space:nowrap;width:auto}.sidebar-content{overflow:auto;height:100%;padding:2px 2px 28px}.cond_row,.trigger_row{grid-template-columns:1fr 80px}.cond_row .cond_value,.trigger_row .trig_action_on{grid-column:1}.cond_row button,.trigger_row button{grid-column:2}}"
+        "#log{height:58vh;margin-top:0;width:70%;box-sizing:border-box}"
+        "@media(max-width:760px){:root{--header-h:66px;--nav-h:48px;--footer-h:28px}.tools{grid-template-columns:1fr 1fr}.check{align-self:center}.formline{grid-template-columns:1fr}.logicbar{display:grid;grid-template-columns:1fr auto}.logicbar select{grid-column:1/-1;max-width:none}.sidebar-layout{display:grid;grid-template-rows:auto minmax(0,1fr);grid-template-columns:1fr}.sidebar{display:flex;gap:6px;overflow:auto;margin-bottom:12px}.sidebar button{white-space:nowrap;width:auto}.sidebar-content{overflow:auto;height:100%;padding:2px 2px 28px}.cond_row,.trigger_row{grid-template-columns:1fr 80px}.cond_row .cond_value,.trigger_row .trig_action_on{grid-column:1}.cond_row button,.trigger_row button{grid-column:2}#log{width:100%}}"
         "button{font-size:15px;padding:8px 12px;margin:0 8px 12px 0;border:1px solid #c6d0d9;border-radius:6px;background:#fff;color:#17212b;cursor:pointer;box-shadow:0 1px 2px #0001;transition:background .15s,border-color .15s,box-shadow .15s}"
         "button:hover:not(:disabled){background:#f1f6fa;border-color:#9fb4c6;box-shadow:0 2px 6px #0002}button:active:not(:disabled){background:#e5eef5;box-shadow:inset 0 1px 3px #0002}"
         "button:disabled{opacity:.5;cursor:not-allowed;box-shadow:none}.primary{background:#1769aa;border-color:#1769aa;color:#fff}.primary:hover:not(:disabled){background:#10578f;border-color:#10578f}.danger{border-color:#d1a0a0;color:#8a1f1f}.danger:hover:not(:disabled){background:#fff1f1;border-color:#bd7777}"
@@ -1245,8 +1211,8 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<div id=automation_modal class=modal onpointerdown='modalPointerDown(event)' onclick='modalBackdropClick(event,closeAutomationModal)'><div class=dialog>"
         "<div class=row><h2 id=auto_modal_title>New automation</h2><button class=iconbtn title=Close aria-label=Close onclick=closeAutomationModal()>&times;</button></div>"
         "<form class=wifi onsubmit='return saveAutomationModal(event)'><div class=formline><label>Name</label><input id=auto_name maxlength=39 value='New automation'></div>"
-        "<div class=label>Conditions</div><div class=formline><label>Connect groups</label><select id=auto_group_logic><option value=AND>All groups must match</option><option value=OR>Any group may match</option></select></div>"
-        "<div id=auto_groups></div><button type=button onclick=addConditionGroup()>Add condition group</button>"
+        "<div class=label>Conditions</div><div class=logicbar><span class=muted>Groups</span><span id=auto_group_logic_chip class=logicchip>AND</span><select id=auto_group_logic onchange=syncLogicLabel(this)><option value=AND>All groups must match</option><option value=OR>Any group may match</option></select></div>"
+        "<div id=auto_groups class=rule_canvas></div><button type=button onclick=addConditionGroup()>Add condition group</button>"
         "<div id=auto_field_help class=hint></div><div class=label>Triggers</div><div id=auto_triggers></div>"
         "<button type=button onclick=addTriggerRow()>Add trigger</button><div class=label>Options</div>"
         "<div class=formline><label>Cooldown seconds</label><input id=auto_cooldown_sec name=cooldown_sec type=number min=5 max=3600 value=30></div>"
@@ -1310,7 +1276,6 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<div id=hue_cards class=grid></div><pre id=hue_output>Hue Bridge discovery uses mDNS. Pairing stores a local Hue app key in NVS.</pre></section>"
         "<section id=automation class=tab><div class=label>Bike to Hue automation</div>"
         "<div class=actions><button class=primary onclick=openAutomationModal()>Add automation</button>"
-        "<button onclick=addDefaultAutomationRule()>Add example low-battery smart plug rule</button>"
         "<button onclick=clearAutomationRules()>Clear rules</button></div>"
         "<p class=hint>Automations run only when fresh bike data arrives. Actions require Wi-Fi and a paired Hue Bridge.</p>"
         "<div id=automation_rules class=tablewrap></div><pre id=automation_preview>Load Hue devices before adding a trigger.</pre></section>"
@@ -1344,7 +1309,6 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<li><code>POST /api/automation/rule/update?index=N</code> replaces an existing rule with a JSON payload.</li>"
         "<li><code>POST /api/automation/rule/enabled</code> form fields <code>index</code> and <code>enabled</code>.</li>"
         "<li><code>POST /api/automation/rule/delete</code> form field <code>index</code>.</li>"
-        "<li><code>POST /api/automation/default</code> form field <code>light_id</code>. Adds the built-in low-battery, not-moving example rule.</li>"
         "<li><code>POST /api/automation/clear</code> removes all automation rules.</li></ul>"
         "<div class=label>Polling</div><p>Clients can poll <code>/api/bike</code> every 1-2 seconds. Poll <code>/api/logs</code> only while a user is watching logs. Push export remains optional and bounded by firmware interval limits.</p>"
         "<div class=label>Home Assistant</div><p>Enable MQTT Discovery in Home Assistant and enter the broker connection here. The ESP publishes retained discovery configs below <code>homeassistant/</code> by default, availability to <code>boschldi/status</code>, and latest bike JSON to <code>boschldi/state</code>. Home Assistant creates entities from the JSON fields; no Home Assistant REST token is stored on the ESP.</p>"
@@ -1411,6 +1375,7 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "function showToast(msg,type,duration){let root=document.getElementById('toast_root'),d=document.createElement('div');d.className='toast '+(type||'error');d.innerHTML=escapeHtml(msg)+'<button onclick=\"this.parentNode.remove()\">&times;</button>';root.appendChild(d);setTimeout(()=>d.remove(),Math.max(2000,duration||5000))}"
         "function modalPointerDown(ev){ev.currentTarget.dataset.backdropDown=ev.target===ev.currentTarget?'1':'0'}"
         "function modalBackdropClick(ev,closeFn){let m=ev.currentTarget;if(ev.target===m&&m.dataset.backdropDown==='1'&&!String(getSelection()).length)closeFn();m.dataset.backdropDown='0'}"
+        "function openModal(id){let m=document.getElementById(id);m.classList.add('open');let d=m.querySelector('.dialog');if(d)d.scrollTop=0}"
         "function hueDeviceRow(id,d){let reachable=!d.state||d.state.reachable!==false,on=!!(d.state&&d.state.on),plug=(d.type||'').toLowerCase().includes('plug')||(d.productname||'').toLowerCase().includes('plug');"
         "let state=reachable?(on?'On':'Off'):'Unreachable',cls=reachable?(on?'on':'off'):'warn',kind=plug?'Smart plug':(d.productname||d.type||'Light');"
         "let bri=d.state&&d.state.bri!=null?Math.round(d.state.bri/254*100)+'%':'-';"
@@ -1429,7 +1394,7 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "h.textContent=hueBridgeCards.length?'Found '+hueBridgeCards.length+' Hue Bridge(s).':'No Hue Bridge discovered.';showToast(h.textContent,hueBridgeCards.length?'ok':'error',3000)}"
         "catch(e){h.textContent='Hue discovery failed';showToast('Hue discovery failed')}}"
         "let huePairTimer=null;"
-        "function openPairModal(name,host){document.getElementById('pair_modal').classList.add('open');document.getElementById('pair_msg').textContent='Please press the button on Hue Bridge '+name+' ('+host+').';document.getElementById('pair_meta').textContent='Waiting for Bridge authorization...'}"
+        "function openPairModal(name,host){openModal('pair_modal');document.getElementById('pair_msg').textContent='Please press the button on Hue Bridge '+name+' ('+host+').';document.getElementById('pair_meta').textContent='Waiting for Bridge authorization...'}"
         "function closePairModal(){document.getElementById('pair_modal').classList.remove('open')}"
         "async function pollHuePair(){try{let r=await fetch('/api/hue/pair/progress',{cache:'no-store'});let j=await r.json();"
         "document.getElementById('pair_meta').textContent='Attempt '+(j.attempt||0)+' / '+(j.max_attempts||30);document.getElementById('hue_output').textContent=JSON.stringify(j,null,2);"
@@ -1445,7 +1410,7 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "async function loadHueDevices(force){if(!force&&Object.keys(lastHueDevices||{}).length&&Date.now()-hueDevicesLoadedAt<30000)return {data:lastHueDevices,available:hueDevicesAvailable,cached:hueDevicesCached};let h=document.getElementById('hue_output');h.textContent='Loading Hue devices...';"
         "try{let r=await fetch('/api/hue/devices',{cache:'no-store'});let j=await r.json();hueDevicesAvailable=!!j.available;hueDevicesCached=!!j.cached;hueDevicesLoadedAt=Date.now();renderHueDevices(j);let n=Object.keys(j.data||{}).length;h.textContent=(hueDevicesAvailable?'Loaded ':'Using cached ')+n+' Hue devices from '+bridgeLabel(j)+(hueDevicesAvailable?'.':' - bridge not currently available.');if(!hueDevicesAvailable)showToast('Hue Bridge/devices not currently available; using cached devices','error',5000);updateAutomationWarningFlags();return j}"
         "catch(e){hueDevicesAvailable=false;hueDevicesCached=Object.keys(lastHueDevices||{}).length>0;h.textContent=hueDevicesCached?'Hue device refresh failed; using browser cache.':'Hue device load failed';showToast(h.textContent,'error');updateAutomationWarningFlags();return {data:lastHueDevices,available:false,cached:hueDevicesCached}}}"
-        "async function showHueDevicesModal(){document.getElementById('devices_modal').classList.add('open');await loadHueDevices()}"
+        "async function showHueDevicesModal(){openModal('devices_modal');await loadHueDevices()}"
         "function closeHueDevicesModal(){document.getElementById('devices_modal').classList.remove('open')}"
         "const bikeFields=[['speed_kmh','Speed km/h','Current bike speed in kilometres per hour.'],['cadence_rpm','Cadence rpm','Pedalling cadence.'],['rider_power_w','Rider power W','Rider power contribution in watts.'],['ambient_brightness_lux','Ambient brightness lux','Brightness measured by the bike system.'],['battery_soc','Battery %','Main battery state of charge.'],['odometer_m','Odometer m','Total distance in metres.'],['bike_light','Bike light','1 means off, 2 means on.'],['system_locked','System locked','1 means the bike reports locked.'],['charger_connected','Charger connected','1 means charger connected.'],['light_reserve_state','Light reserve','Bike light reserve state as numeric value.'],['diagnosis_program_active','Diagnosis active','1 means diagnostic mode active.'],['bike_not_driving','Bike not moving','1 means the bike reports not driving.']];"
         "function fieldOptions(){return bikeFields.map(f=>'<option value=\"'+f[0]+'\">'+f[1]+'</option>').join('')}"
@@ -1464,18 +1429,18 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "try{let r=await fetch('/api/automation/rules',{cache:'no-store'});let j=await r.json();automationRules=j.rules||[];let warn=updateAutomationWarningFlags();box.innerHTML=automationRules.length?'<table><thead><tr><th>Name</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+automationRules.map(ruleRowHtml).join('')+'</tbody></table>':'<div class=device>No automation rules yet.</div>';let note=hueReady()?'Hue Bridge and devices are reachable.':'Hue Bridge and devices not currently available. Automations can be enabled, disabled, or deleted, but editing and trigger tests are disabled.';p.textContent='Up to '+(j.max_rules||6)+' automations. Conditions can be connected with AND or OR. '+note+(warn?' One or more automations reference Hue devices that are no longer available.':'')}"
         "catch(e){p.textContent='Could not load automation rules';showToast('Could not load automation rules','error')}}"
         "function conditionRowHtml(value){return '<div class=\"device cond_row\"><label>Bike field</label><select class=cond_field onchange=updateFieldHelp(this)>'+fieldOptions()+'</select><label>Operator</label><select class=cond_op><option>&lt;</option><option>&lt;=</option><option>==</option><option>&gt;=</option><option>&gt;</option></select><label>Value</label><input class=cond_value type=number step=0.001 value=\"'+(value??1)+'\"><button class=\"iconbtn danger\" title=\"Remove condition\" aria-label=\"Remove condition\" type=button onclick=\"this.parentNode.remove()\">&times;</button></div>'}"
-        "function addConditionRow(btn,field,op,value){let group=btn.closest('.cond_group'),wrap=group.querySelector('.cond_rows'),d=document.createElement('div');d.innerHTML=conditionRowHtml(value);let row=d.firstChild;wrap.appendChild(row);let fs=row.querySelector('.cond_field'),os=row.querySelector('.cond_op');fs.value=field||'battery_soc';os.value=op||'<';updateFieldHelp(fs)}"
-        "function addConditionGroup(logic,conditions){let box=document.getElementById('auto_groups'),g=document.createElement('div');g.className='device cond_group';g.innerHTML='<div class=row><h3>Condition group</h3><button class=\"iconbtn danger\" title=\"Remove group\" aria-label=\"Remove group\" type=button onclick=\"this.closest(\\'.cond_group\\').remove()\">&times;</button></div><label>Connect conditions in this group</label><select class=group_condition_logic><option value=AND>All conditions must match</option><option value=OR>Any condition may match</option></select><div class=cond_rows></div><button type=button onclick=addConditionRow(this)>Add condition</button>';box.appendChild(g);g.querySelector('.group_condition_logic').value=logic||'AND';let add=g.querySelector('button[onclick^=addConditionRow]');(conditions&&conditions.length?conditions:[null]).forEach(c=>c?addConditionRow(add,c.field,c.op,c.value):addConditionRow(add))}"
+        "function syncLogicLabel(sel){let g=sel.closest('.cond_group'),chip=g?g.querySelector('.logicchip'):document.getElementById(sel.id+'_chip');if(chip)chip.textContent=sel.value;if(g)refreshGroupVisual(g)}"
+        "function refreshGroupVisual(g){let logic=(g.querySelector('.group_condition_logic')||{}).value||'AND';g.querySelectorAll('.cond_row').forEach((r,i)=>{r.dataset.logic=i?logic:''})}"
+        "function addConditionRow(btn,field,op,value){let group=btn.closest('.cond_group'),wrap=group.querySelector('.cond_rows'),d=document.createElement('div');d.innerHTML=conditionRowHtml(value);let row=d.firstChild;wrap.appendChild(row);let fs=row.querySelector('.cond_field'),os=row.querySelector('.cond_op');fs.value=field||'battery_soc';os.value=op||'<';updateFieldHelp(fs);refreshGroupVisual(group)}"
+        "function addConditionGroup(logic,conditions){let box=document.getElementById('auto_groups'),g=document.createElement('div');g.className='device cond_group';g.innerHTML='<div class=group_head><div class=group_logic><span class=logicchip>AND</span><select class=group_condition_logic onchange=syncLogicLabel(this)><option value=AND>All conditions</option><option value=OR>Any condition</option></select></div><button class=\"iconbtn danger\" title=\"Remove group\" aria-label=\"Remove group\" type=button onclick=\"this.closest(\\'.cond_group\\').remove()\">&times;</button></div><div class=cond_rows></div><button class=cond_group_add type=button onclick=addConditionRow(this)>Add condition</button>';box.appendChild(g);let logicSel=g.querySelector('.group_condition_logic');logicSel.value=logic||'AND';syncLogicLabel(logicSel);let add=g.querySelector('button[onclick^=addConditionRow]');(conditions&&conditions.length?conditions:[null]).forEach(c=>c?addConditionRow(add,c.field,c.op,c.value):addConditionRow(add));refreshGroupVisual(g)}"
         "function addTriggerRow(lightId,on){let box=document.getElementById('auto_triggers'),d=document.createElement('div');d.className='device trigger_row';d.innerHTML='<label>Hue device</label><select class=trig_light_id></select><label>Mode</label><select class=trig_action_on><option value=true>Turn on</option><option value=false>Turn off</option></select><button class=\"iconbtn danger\" title=\"Remove trigger\" aria-label=\"Remove trigger\" type=button onclick=\"this.parentNode.remove()\">&times;</button>';box.appendChild(d);renderAutomationDeviceOptions(lastHueDevices||{});d.querySelector('.trig_light_id').value=lightId||'';d.querySelector('.trig_action_on').value=on===false?'false':'true'}"
-        "async function openAutomationModal(index){if(!await ensureHueDevicesLoaded(false)){showToast('Hue Bridge and devices not currently available','error',5000);return}editingAutomationIndex=Number.isInteger(index)?index:-1;let r=editingAutomationIndex>=0?automationRules[editingAutomationIndex]:null;document.getElementById('auto_groups').innerHTML='';document.getElementById('auto_triggers').innerHTML='';document.getElementById('auto_modal_title').textContent=r?'Edit automation':'New automation';document.getElementById('auto_name').value=(r&&r.name)||'New automation';document.getElementById('auto_group_logic').value=(r&&r.group_logic)||'AND';document.getElementById('auto_cooldown_sec').value=(r&&r.cooldown_sec)||30;document.getElementById('auto_enabled').checked=r?r.enabled!==false:true;let groups=r&&r.groups?r.groups:[{condition_logic:(r&&r.condition_logic)||'AND',conditions:r?((r.conditions&&r.conditions.length)?r.conditions:[{field:r.field,op:r.op,value:r.value}]):[{field:'battery_soc',op:'<',value:35}]}];groups.forEach(g=>addConditionGroup(g.condition_logic,g.conditions));let first=document.querySelector('.cond_row .cond_field');if(first)updateFieldHelp(first);let ts=r&&r.triggers?r.triggers:(r?[{light_id:r.light_id,action_on:r.action_on}]:[{}]);ts.forEach(t=>addTriggerRow(t.light_id,t.action_on));document.getElementById('automation_modal').classList.add('open')}"
+        "async function openAutomationModal(index){if(!await ensureHueDevicesLoaded(false)){showToast('Hue Bridge and devices not currently available','error',5000);return}editingAutomationIndex=Number.isInteger(index)?index:-1;let r=editingAutomationIndex>=0?automationRules[editingAutomationIndex]:null;document.getElementById('auto_groups').innerHTML='';document.getElementById('auto_triggers').innerHTML='';document.getElementById('auto_modal_title').textContent=r?'Edit automation':'New automation';document.getElementById('auto_name').value=(r&&r.name)||'New automation';let groupLogic=document.getElementById('auto_group_logic');groupLogic.value=(r&&r.group_logic)||'AND';syncLogicLabel(groupLogic);document.getElementById('auto_cooldown_sec').value=(r&&r.cooldown_sec)||30;document.getElementById('auto_enabled').checked=r?r.enabled!==false:true;let groups=r&&r.groups?r.groups:[{condition_logic:(r&&r.condition_logic)||'AND',conditions:r?((r.conditions&&r.conditions.length)?r.conditions:[{field:r.field,op:r.op,value:r.value}]):[{field:'battery_soc',op:'<',value:35}]}];groups.forEach(g=>addConditionGroup(g.condition_logic,g.conditions));let first=document.querySelector('.cond_row .cond_field');if(first)updateFieldHelp(first);let ts=r&&r.triggers?r.triggers:(r?[{light_id:r.light_id,action_on:r.action_on}]:[{}]);ts.forEach(t=>addTriggerRow(t.light_id,t.action_on));openModal('automation_modal')}"
         "async function editAutomation(i){await openAutomationModal(i)}"
         "function closeAutomationModal(){document.getElementById('automation_modal').classList.remove('open');editingAutomationIndex=-1}"
         "async function saveAutomationModal(ev){ev.preventDefault();let p=document.getElementById('automation_preview');let groups=[...document.querySelectorAll('#auto_groups .cond_group')].map(g=>({condition_logic:g.querySelector('.group_condition_logic').value,conditions:[...g.querySelectorAll('.cond_row')].map(d=>({field:d.querySelector('.cond_field').value,op:d.querySelector('.cond_op').value,value:Number(d.querySelector('.cond_value').value)}))})).filter(g=>g.conditions.length);let triggers=[...document.querySelectorAll('#auto_triggers .device')].map(d=>({light_id:d.querySelector('.trig_light_id').value,action_on:d.querySelector('.trig_action_on').value=='true'})).filter(t=>t.light_id);if(!groups.length||!triggers.length){showToast('Add at least one condition group and one trigger','error');return false}let payload={name:document.getElementById('auto_name').value||'Automation',enabled:document.getElementById('auto_enabled').checked,group_logic:document.getElementById('auto_group_logic').value,groups,triggers,cooldown_sec:Number(document.getElementById('auto_cooldown_sec').value||30)};let edit=editingAutomationIndex>=0,url=edit?('/api/automation/rule/update?index='+editingAutomationIndex):'/api/automation/rule';try{let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});let j=await r.json();p.textContent=JSON.stringify(j,null,2);if(!r.ok||j.saved===false||j.updated===false)throw new Error(j.error||'save failed');closeAutomationModal();showToast(edit?'Automation updated':'Automation saved','ok',3000);loadAutomation()}catch(e){p.textContent='Automation save failed';showToast('Automation save failed: '+e.message,'error')}return false}"
         "async function toggleAutomation(i,on){let p=document.getElementById('automation_preview'),b=new URLSearchParams();b.set('index',i);b.set('enabled',on?'1':'0');try{let r=await fetch('/api/automation/rule/enabled',{method:'POST',body:b});let j=await r.json();p.textContent=JSON.stringify(j,null,2);if(!r.ok||j.updated===false)throw new Error(j.error||'update failed');showToast(on?'Automation enabled':'Automation disabled','ok',3000);loadAutomation()}catch(e){showToast('Automation update failed: '+e.message,'error')}}"
         "async function testAutomation(i){if(!await ensureHueDevicesLoaded(false)){showToast('Hue Bridge and devices not currently available','error',5000);return}let p=document.getElementById('automation_preview'),b=new URLSearchParams();b.set('index',i);try{let r=await fetch('/api/automation/rule/test',{method:'POST',body:b});let j=await r.json();p.textContent=JSON.stringify(j,null,2);if(!r.ok||j.tested===false)throw new Error(j.error||'test failed');showToast('Automation triggers tested','ok',3000)}catch(e){showToast('Automation trigger test failed: '+e.message,'error',5000)}}"
         "async function deleteAutomation(i){if(!confirm('Delete this automation?'))return;let p=document.getElementById('automation_preview'),b=new URLSearchParams();b.set('index',i);try{let r=await fetch('/api/automation/rule/delete',{method:'POST',body:b});let j=await r.json();p.textContent=JSON.stringify(j,null,2);if(!r.ok||j.deleted===false)throw new Error(j.error||'delete failed');showToast('Automation deleted','ok',3000);loadAutomation()}catch(e){showToast('Automation delete failed: '+e.message,'error')}}"
-        "async function addDefaultAutomationRule(){let p=document.getElementById('automation_preview');if(!await ensureHueDevicesLoaded(false)){showToast('Hue Bridge and devices not currently available','error',5000);return false}let ids=Object.keys(lastHueDevices||{}).sort((a,b)=>isPlug(lastHueDevices[b])-isPlug(lastHueDevices[a])||String(lastHueDevices[a].name||a).localeCompare(String(lastHueDevices[b].name||b))),id=ids[0]||'';if(!id){showToast('No Hue devices loaded','error',5000);return false}"
-        "let b=new URLSearchParams();b.set('light_id',id);try{let r=await fetch('/api/automation/default',{method:'POST',body:b});let j=await r.json();p.textContent=JSON.stringify(j,null,2);showToast('Example automation rule saved','ok',3000);loadAutomation()}catch(e){p.textContent='Example rule save failed';showToast('Example rule save failed','error')}return false}"
         "async function clearAutomationRules(){let p=document.getElementById('automation_preview');try{let r=await fetch('/api/automation/clear',{method:'POST'});let j=await r.json();p.textContent=JSON.stringify(j,null,2);showToast('Automation rules cleared','ok',3000);loadAutomation()}catch(e){p.textContent='Rule clear failed';showToast('Rule clear failed','error')}}"
         "async function clearHue(){let h=document.getElementById('hue_output');h.textContent='Clearing Hue pairing...';"
         "try{let r=await fetch('/api/hue/clear',{method:'POST'});let j=await r.json();h.textContent=JSON.stringify(j,null,2);huePaired=false;hueBridgeCards=[];lastHueDevices={};hueDevicesAvailable=false;hueDevicesCached=false;hueDevicesLoadedAt=0;document.getElementById('automation_tab_btn').style.display='none';document.getElementById('hue_discover_btn').style.display='inline-block';document.getElementById('hue_cards').innerHTML='';document.getElementById('hue_devices_modal').innerHTML='';showToast('Hue Bridge disconnected','ok',3000)}"
@@ -1925,13 +1890,6 @@ static esp_err_t start_http_server(bool setup_mode)
         .handler = api_automation_rule_test_post_handler,
     };
     httpd_register_uri_handler(http_server, &api_automation_rule_test);
-
-    const httpd_uri_t api_automation_default = {
-        .uri = "/api/automation/default",
-        .method = HTTP_POST,
-        .handler = api_automation_default_post_handler,
-    };
-    httpd_register_uri_handler(http_server, &api_automation_default);
 
     const httpd_uri_t api_automation_clear = {
         .uri = "/api/automation/clear",
