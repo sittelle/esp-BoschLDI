@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "automation.h"
+#include "bike_history.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "persistent_log.h"
@@ -420,6 +421,79 @@ static void persist_live_data_sample(const live_data_t *data)
     }
 }
 
+static uint32_t sample_unix_time(const live_data_t *data)
+{
+    if (data != NULL && data->has_time && data->time > 0) {
+        return (uint32_t)data->time;
+    }
+    if (latest_state.last_update_unix_time > 0) {
+        return (uint32_t)latest_state.last_update_unix_time;
+    }
+    return 0;
+}
+
+static void persist_live_data_history_sample(const live_data_t *data)
+{
+    if (data == NULL) {
+        return;
+    }
+
+    uint32_t ts = sample_unix_time(data);
+    if (data->has_time) {
+        bike_history_append(BIKE_HISTORY_FIELD_TIME, BIKE_HISTORY_TYPE_U32,
+                            (int32_t)(uint32_t)data->time, ts);
+    }
+    if (data->has_speed) {
+        bike_history_append(BIKE_HISTORY_FIELD_SPEED_KMH_CENTI, BIKE_HISTORY_TYPE_U32,
+                            (int32_t)data->speed, ts);
+    }
+    if (data->has_cadence) {
+        bike_history_append(BIKE_HISTORY_FIELD_CADENCE_RPM, BIKE_HISTORY_TYPE_I32,
+                            data->cadence, ts);
+    }
+    if (data->has_rider_power) {
+        bike_history_append(BIKE_HISTORY_FIELD_RIDER_POWER_W, BIKE_HISTORY_TYPE_U32,
+                            (int32_t)data->rider_power, ts);
+    }
+    if (data->has_ambient_brightness) {
+        bike_history_append(BIKE_HISTORY_FIELD_AMBIENT_BRIGHTNESS_MILLILUX,
+                            BIKE_HISTORY_TYPE_U32, (int32_t)data->ambient_brightness, ts);
+    }
+    if (data->has_battery_soc) {
+        bike_history_append(BIKE_HISTORY_FIELD_BATTERY_SOC, BIKE_HISTORY_TYPE_U32,
+                            (int32_t)data->battery_soc, ts);
+    }
+    if (data->has_odometer) {
+        bike_history_append(BIKE_HISTORY_FIELD_ODOMETER_M, BIKE_HISTORY_TYPE_U32,
+                            (int32_t)data->odometer, ts);
+    }
+    if (data->has_bike_light) {
+        bike_history_append(BIKE_HISTORY_FIELD_BIKE_LIGHT, BIKE_HISTORY_TYPE_U32,
+                            (int32_t)data->bike_light, ts);
+    }
+    if (data->has_system_locked) {
+        bike_history_append(BIKE_HISTORY_FIELD_SYSTEM_LOCKED, BIKE_HISTORY_TYPE_BOOL,
+                            data->system_locked ? 1 : 0, ts);
+    }
+    if (data->has_charger_connected) {
+        bike_history_append(BIKE_HISTORY_FIELD_CHARGER_CONNECTED, BIKE_HISTORY_TYPE_BOOL,
+                            data->charger_connected ? 1 : 0, ts);
+    }
+    if (data->has_light_reserve_state) {
+        bike_history_append(BIKE_HISTORY_FIELD_LIGHT_RESERVE_STATE, BIKE_HISTORY_TYPE_BOOL,
+                            data->light_reserve_state ? 1 : 0, ts);
+    }
+    if (data->has_diagnosis_program_active) {
+        bike_history_append(BIKE_HISTORY_FIELD_DIAGNOSIS_PROGRAM_ACTIVE,
+                            BIKE_HISTORY_TYPE_BOOL,
+                            data->diagnosis_program_active ? 1 : 0, ts);
+    }
+    if (data->has_bike_not_driving) {
+        bike_history_append(BIKE_HISTORY_FIELD_BIKE_NOT_DRIVING, BIKE_HISTORY_TYPE_BOOL,
+                            data->bike_not_driving ? 1 : 0, ts);
+    }
+}
+
 static bool live_data_state_has_any(const live_data_t *data)
 {
     return data != NULL &&
@@ -493,6 +567,12 @@ void live_data_init(void)
     fclose(f);
     persisted_latest_json[len] = '\0';
     persisted_latest_loaded = len > 0;
+    if (persisted_latest_loaded && strstr(persisted_latest_json, "last_update_boot_ms") != NULL) {
+        persisted_latest_json[0] = '\0';
+        persisted_latest_loaded = false;
+        ESP_LOGW(TAG, "ignored legacy latest bike snapshot with ESP receive metadata");
+        return;
+    }
     if (persisted_latest_loaded) {
         ESP_LOGI(TAG, "loaded persisted latest bike data snapshot");
     }
@@ -525,9 +605,6 @@ bool live_data_latest_json(char *out, size_t out_len)
         } \
     } while (0)
 
-    if (data.last_update_boot_ms > 0) {
-        ADD_JSON_FIELD("\"last_update_boot_ms\":%" PRId64, data.last_update_boot_ms);
-    }
     if (data.last_update_unix_time > 0) {
         char iso[32] = {0};
         time_t unix_time = (time_t)data.last_update_unix_time;
@@ -812,6 +889,7 @@ bool live_data_decode_and_log(const uint8_t *buf, size_t len)
 
     uint32_t changed_mask = changed_field_mask(&data);
     log_live_data(&data);
+    persist_live_data_history_sample(&data);
     merge_latest_state(&data);
     persist_live_data_sample(&latest_state);
     persist_latest_state_json_if_due(changed_mask);

@@ -1,4 +1,5 @@
 #include "automation.h"
+#include "bike_history.h"
 #include "ble_gap.h"
 #include "home_assistant.h"
 #include "live_data_decode.h"
@@ -89,6 +90,10 @@ void app_main(void)
         persistent_log_event("info", "system", "boot reset_reason=%s(%d)",
                              reset_reason_name(reset_reason), (int)reset_reason);
         live_data_init();
+        err = bike_history_init();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "bike history init failed; err=%s", esp_err_to_name(err));
+        }
     }
 
     err = status_led_init();

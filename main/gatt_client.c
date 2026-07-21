@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "nimble/ble.h"
 
 static const char *TAG = "gatt_client";
 
@@ -25,6 +26,7 @@ typedef struct {
     uint16_t service_end;
     uint16_t live_data_handle;
     uint16_t live_data_cccd_handle;
+    bool connected;
     bool mtu_ok;
     bool discovery_started;
 } client_state_t;
@@ -52,10 +54,16 @@ static int cccd_write_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
 static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                    struct ble_gatt_attr *attr, void *arg);
 static void ensure_live_data_worker(void);
+static void fail_connection(uint16_t conn_handle, const char *reason);
 
 void gatt_client_reset(void)
 {
     memset(&state, 0, sizeof(state));
+}
+
+bool gatt_client_is_connected(void)
+{
+    return state.connected;
 }
 
 void gatt_client_on_connect(uint16_t conn_handle)
@@ -63,6 +71,7 @@ void gatt_client_on_connect(uint16_t conn_handle)
     ensure_live_data_worker();
     gatt_client_reset();
     state.conn_handle = conn_handle;
+    state.connected = true;
 
     int rc = ble_gap_write_sugg_def_data_len(BOSCH_LDI_MIN_LL_OCTETS, 2120);
     if (rc != 0) {
@@ -84,6 +93,7 @@ void gatt_client_on_connect(uint16_t conn_handle)
         ESP_LOGE(TAG, "ATT MTU exchange request failed; rc=%d", rc);
         persistent_log_event("error", "bike_connection",
                              "ATT MTU exchange request failed handle=%u rc=%d", conn_handle, rc);
+        fail_connection(conn_handle, "MTU exchange request failed");
     }
 }
 
@@ -110,6 +120,24 @@ void gatt_client_on_encrypted(uint16_t conn_handle)
         ESP_LOGI(TAG, "service discovery started; uuid=eb20");
     } else {
         ESP_LOGE(TAG, "service discovery start failed; rc=%d", rc);
+        persistent_log_event("error", "bike_connection",
+                             "service discovery start failed rc=%d", rc);
+        fail_connection(conn_handle, "service discovery start failed");
+    }
+}
+
+static void fail_connection(uint16_t conn_handle, const char *reason)
+{
+    status_led_set(STATUS_LED_ERROR);
+    if (state.connected && state.conn_handle == conn_handle) {
+        int rc = ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "failed connection terminate failed; rc=%d reason=%s",
+                     rc, reason != NULL ? reason : "unknown");
+            persistent_log_event("warn", "bike_connection",
+                                 "failed connection terminate failed rc=%d reason=%s",
+                                 rc, reason != NULL ? reason : "unknown");
+        }
     }
 }
 
@@ -122,6 +150,7 @@ static int mtu_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         persistent_log_event("error", "bike_connection",
                              "ATT MTU exchange failed handle=%u status=%u",
                              conn_handle, error->status);
+        fail_connection(conn_handle, "ATT MTU exchange failed");
         return 0;
     }
 
@@ -145,7 +174,7 @@ static int service_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         if (state.service_start == 0) {
             ESP_LOGE(TAG, "Live Data service eb20 not found");
             persistent_log_event("error", "bike_connection", "Live Data service eb20 not found");
-            status_led_set(STATUS_LED_ERROR);
+            fail_connection(conn_handle, "Live Data service eb20 not found");
         }
         return 0;
     }
@@ -153,7 +182,7 @@ static int service_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         ESP_LOGE(TAG, "service discovery failed; status=%u", error->status);
         persistent_log_event("error", "bike_connection",
                              "service discovery failed status=%u", error->status);
-        status_led_set(STATUS_LED_ERROR);
+        fail_connection(conn_handle, "service discovery failed");
         return 0;
     }
 
@@ -172,6 +201,7 @@ static int service_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         ESP_LOGE(TAG, "characteristic discovery start failed; rc=%d", rc);
         persistent_log_event("error", "bike_connection",
                              "characteristic discovery start failed rc=%d", rc);
+        fail_connection(conn_handle, "characteristic discovery start failed");
     }
     return 0;
 }
@@ -185,7 +215,7 @@ static int chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
             ESP_LOGE(TAG, "Live Data characteristic eb21 not found");
             persistent_log_event("error", "bike_connection",
                                  "Live Data characteristic eb21 not found");
-            status_led_set(STATUS_LED_ERROR);
+            fail_connection(conn_handle, "Live Data characteristic eb21 not found");
         }
         return 0;
     }
@@ -193,7 +223,7 @@ static int chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         ESP_LOGE(TAG, "characteristic discovery failed; status=%u", error->status);
         persistent_log_event("error", "bike_connection",
                              "characteristic discovery failed status=%u", error->status);
-        status_led_set(STATUS_LED_ERROR);
+        fail_connection(conn_handle, "characteristic discovery failed");
         return 0;
     }
 
@@ -215,6 +245,7 @@ static int chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         ESP_LOGE(TAG, "descriptor discovery start failed; rc=%d", rc);
         persistent_log_event("error", "bike_connection",
                              "descriptor discovery start failed rc=%d", rc);
+        fail_connection(conn_handle, "descriptor discovery start failed");
     }
     return 0;
 }
@@ -229,7 +260,7 @@ static int dsc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         if (state.live_data_cccd_handle == 0) {
             ESP_LOGE(TAG, "Live Data CCCD 0x2902 not found");
             persistent_log_event("error", "bike_connection", "Live Data CCCD 0x2902 not found");
-            status_led_set(STATUS_LED_ERROR);
+            fail_connection(conn_handle, "Live Data CCCD not found");
             return 0;
         }
 
@@ -244,6 +275,7 @@ static int dsc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
             ESP_LOGE(TAG, "CCCD subscription write failed to start; rc=%d", rc);
             persistent_log_event("error", "bike_connection",
                                  "CCCD subscription write failed to start rc=%d", rc);
+            fail_connection(conn_handle, "CCCD subscription write failed to start");
         }
         return 0;
     }
@@ -251,7 +283,7 @@ static int dsc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         ESP_LOGE(TAG, "descriptor discovery failed; status=%u", error->status);
         persistent_log_event("error", "bike_connection",
                              "descriptor discovery failed status=%u", error->status);
-        status_led_set(STATUS_LED_ERROR);
+        fail_connection(conn_handle, "descriptor discovery failed");
         return 0;
     }
 
@@ -273,7 +305,7 @@ static int cccd_write_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
         ESP_LOGE(TAG, "CCCD subscription failed; status=%u", error->status);
         persistent_log_event("error", "bike_connection",
                              "CCCD subscription failed status=%u", error->status);
-        status_led_set(STATUS_LED_ERROR);
+        fail_connection(conn_handle, "CCCD subscription failed");
         return 0;
     }
 

@@ -6,32 +6,31 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$script = @"
-import serial
-import sys
-import time
+$toolEsptool = Join-Path $env:USERPROFILE ".platformio\packages\tool-esptoolpy"
+if (Test-Path $toolEsptool) {
+    if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) {
+        $env:PYTHONPATH = $toolEsptool
+    } elseif (!$env:PYTHONPATH.Split([System.IO.Path]::PathSeparator).Contains($toolEsptool)) {
+        $env:PYTHONPATH = "$toolEsptool$([System.IO.Path]::PathSeparator)$env:PYTHONPATH"
+    }
+}
+$pioPenvSitePackages = Join-Path $env:USERPROFILE ".platformio\penv\Lib\site-packages"
+if (Test-Path $pioPenvSitePackages) {
+    if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) {
+        $env:PYTHONPATH = $pioPenvSitePackages
+    } elseif (!$env:PYTHONPATH.Split([System.IO.Path]::PathSeparator).Contains($pioPenvSitePackages)) {
+        $env:PYTHONPATH = "$pioPenvSitePackages$([System.IO.Path]::PathSeparator)$env:PYTHONPATH"
+    }
+}
 
-port = sys.argv[1]
-baud = int(sys.argv[2])
+$pioPython = Join-Path $env:USERPROFILE ".platformio\penv\.espidf-5.5.4\Scripts\python.exe"
+if (!(Test-Path $pioPython)) {
+    $pioPython = "python"
+}
 
-ser = serial.Serial(port, baud, timeout=0.1)
-try:
-    # On this ESP32-S3 DevKit, DTR=False can hold BOOT low through the
-    # auto-reset circuit. Release BOOT, pulse EN/RTS, then close the port.
-    ser.dtr = True
-    ser.rts = False
-    time.sleep(0.2)
-    ser.rts = True
-    time.sleep(0.15)
-    ser.rts = False
-    time.sleep(0.2)
-finally:
-    ser.close()
-"@
-
-python -c $script $Port $Baud
+& $pioPython -m esptool --chip esp32s3 --port $Port --baud $Baud run
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-Write-Host "Released BOOT and pulsed reset on $Port."
+Write-Host "Started app from flash on $Port."

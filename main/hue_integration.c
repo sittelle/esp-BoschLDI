@@ -23,6 +23,7 @@
 #define HUE_DISCOVERY_MAX_RESULTS 6
 #define HUE_HTTP_TIMEOUT_MS 5000
 #define HUE_PAIR_RESPONSE_SIZE 1024
+#define HUE_CONFIG_RESPONSE_SIZE 4096
 #define HUE_DEVICES_RESPONSE_SIZE 20000
 #define HUE_RESOURCES_RESPONSE_SIZE 28000
 #define HUE_PAIR_WINDOW_ATTEMPTS 30
@@ -249,6 +250,64 @@ static bool hue_discover_bridge(const char *requested_host,
     return found;
 }
 
+static bool hue_refresh_bridge_config(accessory_hue_config_t *config)
+{
+    if (config == NULL || config->bridge_host[0] == '\0' || config->app_key[0] == '\0') {
+        return false;
+    }
+
+    char url[192];
+    snprintf(url, sizeof(url), "http://%s/api/%s/config",
+             config->bridge_host, config->app_key);
+
+    char *response = malloc(HUE_CONFIG_RESPONSE_SIZE);
+    if (response == NULL) {
+        return false;
+    }
+
+    int status = 0;
+    esp_err_t err = hue_http_request(url, HTTP_METHOD_GET, NULL, response,
+                                     HUE_CONFIG_RESPONSE_SIZE, &status);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Hue Bridge config request failed host=%s status=%d err=%s",
+                 config->bridge_host, status, esp_err_to_name(err));
+        free(response);
+        return false;
+    }
+
+    bool changed = false;
+    cJSON *root = cJSON_Parse(response);
+    free(response);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    cJSON *name = cJSON_GetObjectItem(root, "name");
+    if (cJSON_IsString(name) && name->valuestring != NULL &&
+        name->valuestring[0] != '\0' &&
+        strcmp(config->bridge_name, name->valuestring) != 0) {
+        strlcpy(config->bridge_name, name->valuestring, sizeof(config->bridge_name));
+        changed = true;
+    }
+
+    cJSON *bridge_id = cJSON_GetObjectItem(root, "bridgeid");
+    if (cJSON_IsString(bridge_id) && bridge_id->valuestring != NULL &&
+        bridge_id->valuestring[0] != '\0' &&
+        strcmp(config->bridge_id, bridge_id->valuestring) != 0) {
+        strlcpy(config->bridge_id, bridge_id->valuestring, sizeof(config->bridge_id));
+        changed = true;
+    }
+
+    cJSON_Delete(root);
+    if (changed) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(accessory_config_save_hue(config));
+        persistent_log_event("info", "hue", "bridge config refreshed name=%s bridge_id=%s",
+                             config->bridge_name, config->bridge_id);
+    }
+    return changed;
+}
+
 static bool hue_parse_pair_success(const char *json, char *app_key, size_t app_key_len,
                                    char *error, size_t error_len)
 {
@@ -339,6 +398,9 @@ esp_err_t hue_integration_status_json(char *out, size_t out_len)
 {
     accessory_hue_config_t config;
     accessory_config_load_hue(&config);
+    if (config.app_key[0] != '\0' && config.bridge_name[0] == '\0') {
+        hue_refresh_bridge_config(&config);
+    }
     if (config.app_key[0] != '\0' && config.bridge_name[0] == '\0') {
         char discovered_host[ACCESSORY_HUE_HOST_MAX_LEN + 1] = "";
         char discovered_id[ACCESSORY_HUE_BRIDGE_ID_MAX_LEN + 1] = "";
@@ -440,6 +502,7 @@ esp_err_t hue_integration_pair_json(const char *bridge_host, char *out, size_t o
     strlcpy(config.bridge_id, bridge_id, sizeof(config.bridge_id));
     strlcpy(config.bridge_name, bridge_name, sizeof(config.bridge_name));
     strlcpy(config.app_key, app_key, sizeof(config.app_key));
+    hue_refresh_bridge_config(&config);
     err = accessory_config_save_hue(&config);
     if (err != ESP_OK) {
         snprintf(out, out_len,

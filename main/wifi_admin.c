@@ -2,7 +2,9 @@
 
 #include "accessory_config.h"
 #include "automation.h"
+#include "bike_history.h"
 #include "ble_gap.h"
+#include "gatt_client.h"
 #include "hue_integration.h"
 #include "live_data_decode.h"
 #include "log_store.h"
@@ -23,6 +25,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_ota_ops.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -42,10 +45,12 @@
 #define WIFI_ADMIN_CONNECT_TIMEOUT_MS 12000
 #define WIFI_ADMIN_MAX_SCAN_RESULTS 16
 #define WIFI_ADMIN_LOG_RESPONSE_SIZE 8192
+#define WIFI_ADMIN_BIKE_HISTORY_RESPONSE_SIZE 28000
 #define WIFI_ADMIN_HUE_RESPONSE_SIZE 2048
 #define WIFI_ADMIN_HUE_DEVICES_RESPONSE_SIZE 20000
 #define WIFI_ADMIN_HUE_RESOURCES_RESPONSE_SIZE 28000
 #define WIFI_ADMIN_AUTOMATION_RESPONSE_SIZE 8192
+#define WIFI_ADMIN_OTA_CHUNK_SIZE 4096
 
 static const char *TAG = "wifi_admin";
 static const EventBits_t WIFI_CONNECTED_BIT = BIT0;
@@ -450,21 +455,6 @@ static esp_err_t setup_root_get_handler(httpd_req_t *req)
     return httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
 }
 
-static esp_err_t logs_get_handler(httpd_req_t *req)
-{
-    char *logs = malloc(WIFI_ADMIN_LOG_RESPONSE_SIZE);
-    if (logs == NULL) {
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_sendstr(req, "log buffer allocation failed\n");
-    }
-
-    log_store_copy(logs, WIFI_ADMIN_LOG_RESPONSE_SIZE);
-    httpd_resp_set_type(req, "text/plain");
-    esp_err_t err = httpd_resp_sendstr(req, logs);
-    free(logs);
-    return err;
-}
-
 static esp_err_t latest_get_handler(httpd_req_t *req)
 {
     char latest[384];
@@ -593,12 +583,46 @@ static esp_err_t api_bike_get_handler(httpd_req_t *req)
     bool has_data = live_data_latest_json(bike_json, sizeof(bike_json));
     char response[1800];
     snprintf(response, sizeof(response),
-             "{\"type\":\"bike_data\",\"boot_ms\":%lld,\"has_data\":%s,\"data\":%s}",
+             "{\"type\":\"bike_data\",\"boot_ms\":%lld,\"bike_connected\":%s,\"has_data\":%s,\"data\":%s}",
              (long long)(esp_timer_get_time() / 1000),
+             gatt_client_is_connected() ? "true" : "false",
              has_data ? "true" : "false",
              has_data ? bike_json : "{}");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, response);
+}
+
+static esp_err_t api_bike_history_get_handler(httpd_req_t *req)
+{
+    uint8_t field_id = BIKE_HISTORY_FIELD_BATTERY_SOC;
+    char query[48];
+    char field[8];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "field", field, sizeof(field)) == ESP_OK) {
+        unsigned long parsed = strtoul(field, NULL, 10);
+        if (parsed > 0 && parsed <= UINT8_MAX) {
+            field_id = (uint8_t)parsed;
+        }
+    }
+
+    char *history = malloc(WIFI_ADMIN_BIKE_HISTORY_RESPONSE_SIZE);
+    if (history == NULL) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"bike history buffer allocation failed\"}");
+    }
+
+    esp_err_t err = bike_history_field_json(field_id, history,
+                                            WIFI_ADMIN_BIKE_HISTORY_RESPONSE_SIZE);
+    if (err != ESP_OK) {
+        free(history);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"bike history export failed\"}");
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t send_err = httpd_resp_sendstr(req, history);
+    free(history);
+    return send_err;
 }
 
 static esp_err_t api_state_get_handler(httpd_req_t *req)
@@ -619,11 +643,12 @@ static esp_err_t api_state_get_handler(httpd_req_t *req)
     json_escape(escaped_logs, WIFI_ADMIN_LOG_RESPONSE_SIZE * 2, logs);
 
     httpd_resp_set_type(req, "application/json");
-    char prefix[160];
+    char prefix[192];
     snprintf(prefix, sizeof(prefix),
-             "{\"type\":\"state\",\"boot_ms\":%lld,\"bike\":{\"has_data\":%s,\"data\":%s},"
+             "{\"type\":\"state\",\"boot_ms\":%lld,\"bike\":{\"connected\":%s,\"has_data\":%s,\"data\":%s},"
              "\"logs\":{\"bytes\":%u,\"logs\":\"",
              (long long)(esp_timer_get_time() / 1000),
+             gatt_client_is_connected() ? "true" : "false",
              has_data ? "true" : "false", has_data ? bike_json : "{}",
              (unsigned)bytes);
     httpd_resp_sendstr_chunk(req, prefix);
@@ -1105,76 +1130,47 @@ static esp_err_t api_hue_clear_post_handler(httpd_req_t *req)
     return send_hue_json_response(req, response, err);
 }
 
-static esp_err_t send_file_response(httpd_req_t *req, const char *path)
-{
-    FILE *f = fopen(path, "r");
-    if (f == NULL) {
-        httpd_resp_set_type(req, "text/plain");
-        return httpd_resp_sendstr(req, "No persistent log file yet.\n");
-    }
-
-    httpd_resp_set_type(req, "text/plain");
-    char chunk[384];
-    while (!feof(f)) {
-        size_t read_len = fread(chunk, 1, sizeof(chunk), f);
-        if (read_len > 0) {
-            esp_err_t err = httpd_resp_send_chunk(req, chunk, read_len);
-            if (err != ESP_OK) {
-                fclose(f);
-                return err;
-            }
-        }
-    }
-    fclose(f);
-    return httpd_resp_send_chunk(req, NULL, 0);
-}
-
-static esp_err_t persistent_log_get_handler(httpd_req_t *req)
-{
-    return send_file_response(req, persistent_log_path_current());
-}
-
-static esp_err_t persistent_log_previous_get_handler(httpd_req_t *req)
-{
-    return send_file_response(req, persistent_log_path_previous());
-}
-
 static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
 {
     static const char page[] =
         "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
         "<title>Bosch LDI</title><style>"
-        ":root{--header-h:66px;--nav-h:46px;--footer-h:28px}"
-        "body{font-family:system-ui,sans-serif;margin:0;background:#f6f7f8;color:#171717;overflow:hidden}"
-        "header{position:fixed;top:0;left:0;right:0;height:var(--header-h);box-sizing:border-box;z-index:10;padding:16px 20px;background:#fff;border-bottom:1px solid #ddd}"
-        "h1{font-size:20px;margin:0}.meta{color:#555;margin-top:4px}"
+        ":root{--header-h:58px;--nav-h:46px;--footer-h:36px}"
+        "body{font-family:system-ui,sans-serif;margin:0;background:#f6f7f8;color:#171717;overflow-y:auto;overflow-x:hidden}"
+        "header{position:fixed;top:0;left:0;right:0;height:var(--header-h);box-sizing:border-box;z-index:10;padding:0 20px;background:#fff;border-bottom:1px solid #ddd;display:flex;align-items:center;justify-content:space-between;gap:16px}"
+        "h1{font-size:20px;margin:0}.statusline{display:flex;align-items:center;gap:8px;color:#4e5963;font-size:14px;white-space:nowrap}.statusdot{width:10px;height:10px;border-radius:50%;background:#b02a2a;box-shadow:0 0 0 3px #b02a2a22}.statusdot.ok{background:#17883b;box-shadow:0 0 0 3px #17883b22}.statussep{color:#a0a8af}"
         "nav{position:fixed;top:var(--header-h);left:0;right:0;height:var(--nav-h);box-sizing:border-box;z-index:10;display:flex;gap:4px;padding:0 20px;background:#fff;border-bottom:1px solid #ddd;overflow-x:auto}"
         ".tabbtn{border:0;background:#fff;border-bottom:3px solid transparent;margin:0;padding:12px 14px;cursor:pointer;border-radius:0;box-shadow:none}"
         ".tabbtn.active{border-bottom-color:#1769aa;color:#0f4f82;font-weight:700}.tabbtn.warnflag{color:#6b4200}.tabbtn.warnflag::after{content:' !';font-weight:800}"
-        "main{position:fixed;top:calc(var(--header-h) + var(--nav-h));bottom:var(--footer-h);left:0;right:0;overflow:hidden;padding:16px 20px;box-sizing:border-box}"
-        "footer{position:fixed;left:0;right:0;bottom:0;height:var(--footer-h);z-index:10;background:#fff;border-top:1px solid #ddd}"
-        ".tab{display:none;height:100%;overflow:auto;box-sizing:border-box;padding:2px 2px 28px;scrollbar-gutter:stable}.tab.active{display:block}"
+        "main{min-height:calc(100vh - var(--header-h) - var(--nav-h) - var(--footer-h));padding:26px 20px calc(var(--footer-h) + 28px);margin-top:calc(var(--header-h) + var(--nav-h));box-sizing:border-box}"
+        "footer{position:fixed;left:0;right:0;bottom:0;height:var(--footer-h);z-index:10;background:#fff;border-top:1px solid #ddd;box-sizing:border-box;padding:0 20px;display:flex;align-items:center;gap:18px;color:#59636d;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+        ".tab{display:none;box-sizing:border-box;padding:2px}.tab.active{display:block}"
         ".label{font-size:13px;font-weight:700;margin:12px 0 6px}"
         ".hint{color:#555;margin:4px 0 10px}"
         "section{margin:0 0 18px}.wifi{display:grid;gap:8px;width:100%}"
         "label,input,select{font-size:15px}input,select{padding:8px;width:100%;box-sizing:border-box}"
         ".formline{display:grid;grid-template-columns:minmax(120px,180px) minmax(0,1fr) auto;gap:8px;align-items:center}.formline label{margin:0}.formline button{margin:0}"
-        ".tools{display:grid;grid-template-columns:minmax(180px,1fr) 140px minmax(130px,220px) auto;gap:8px;align-items:end}"
+        ".tools{display:grid;grid-template-columns:minmax(160px,320px) 140px minmax(150px,220px) auto;gap:8px;align-items:end}"
         ".check{display:flex;gap:6px;align-items:center;white-space:nowrap}.check input{width:auto}"
         ".count{color:#555;font-size:13px;margin:0 0 6px}.empty{color:#aaa}"
         ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin:10px 0 16px}"
         ".device{background:#fff;border:1px solid #d8dde2;border-radius:6px;padding:12px;display:grid;gap:7px}"
         ".device h3{font-size:16px;margin:0}.row{display:flex;justify-content:space-between;gap:10px;align-items:center}"
+        ".bikebar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:6px 0 10px;color:#555}.bikegrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}"
+        ".bikeitem{background:#fff;border:1px solid #d8dde2;border-radius:6px;padding:9px 10px;display:grid;gap:5px;min-height:70px;transition:border-color .2s,box-shadow .2s,background .2s}.bikeitem.changed{animation:valueFlash 1.8s ease-out both;animation-delay:var(--flash-delay,0ms);border-color:#1f8f4d;box-shadow:0 0 0 3px #1f8f4d22}@keyframes valueFlash{0%{background:#dff7e8;transform:translateY(-1px)}45%{background:#eefbf3}100%{background:#fff;transform:translateY(0)}}.bikehead{display:flex;align-items:flex-start;gap:6px;min-width:0}"
+        ".bikename{font-weight:700;line-height:1.2;font-size:14px}.fieldkey{color:#66717b;font:11px ui-monospace,Consolas,monospace}.infobadge{display:inline-grid;place-items:center;flex:0 0 auto;width:16px;height:16px;border-radius:50%;background:#e7f1f8;color:#0f4f82;font-weight:800;font-size:11px;cursor:help}.bikevalue{font-size:17px;font-weight:700;word-break:break-word}.bikevalue.empty{color:#a5adb5;font-weight:500}"
+        ".historypanel{margin-top:18px;background:#fff;border:1px solid #d8dde2;border-radius:6px;padding:12px;display:grid;gap:10px}.historytools{display:grid;grid-template-columns:minmax(160px,280px) 1fr;gap:10px;align-items:end}.chartbox{height:260px;border:1px solid #e2e7eb;border-radius:6px;background:#fbfcfd;overflow:hidden}.chartbox svg{width:100%;height:100%;display:block}.chartline{fill:none;stroke:#1769aa;stroke-width:2.5}.chartarea{fill:#1769aa12}.chartgrid{stroke:#dfe6ec;stroke-width:1}.chartlabel{fill:#66717b;font-size:11px}.historytable{max-height:220px;overflow:auto}.historytable table{min-width:520px}.historysummary{display:flex;gap:8px;flex-wrap:wrap;align-items:center;color:#555;font-size:13px}"
+        ".sliderrow{display:grid;grid-template-columns:minmax(120px,180px) minmax(180px,420px) auto;gap:12px;align-items:center}.sliderwrap{position:relative;height:38px;display:flex;align-items:center}.sliderwrap::before{content:'';position:absolute;left:0;right:0;top:50%;height:18px;transform:translateY(-50%);clip-path:polygon(0 46%,100% 0,100% 100%,0 54%);background:linear-gradient(90deg,#d7e6f2,#1769aa);border-radius:999px}.sliderwrap input{position:relative;z-index:1;width:100%;background:transparent;appearance:none;-webkit-appearance:none;padding:0}.sliderwrap input::-webkit-slider-runnable-track{height:28px;background:transparent}.sliderwrap input::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;margin-top:3px;border-radius:50%;background:#fff;border:2px solid #1769aa;box-shadow:0 2px 8px #0003}.sliderwrap input::-moz-range-track{height:28px;background:transparent}.sliderwrap input::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:#fff;border:2px solid #1769aa;box-shadow:0 2px 8px #0003}.valuepill{min-width:54px;text-align:center;font-weight:700;background:#edf4f9;border:1px solid #c9dce9;border-radius:999px;padding:5px 10px}.autosave{font-size:12px;color:#66717b;min-height:18px}"
         ".cond_row{grid-template-columns:minmax(180px,1fr) 86px minmax(110px,160px) auto;align-items:end}.trigger_row{grid-template-columns:minmax(220px,1fr) 140px auto;align-items:end}.cond_row label,.trigger_row label{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}.cond_row button,.trigger_row button{margin:0}"
         ".logicbar{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#eef5fa;border:1px solid #c9dce9;border-radius:6px}.logicbar select{max-width:260px}.logicchip{display:inline-grid;place-items:center;min-width:44px;height:26px;padding:0 9px;border-radius:999px;background:#1769aa;color:#fff;font-weight:800;font-size:12px;letter-spacing:.5px}.rule_canvas{display:grid;gap:12px}.cond_group{position:relative;border-color:#b8d0e2;background:#fbfdff;padding:0;overflow:hidden}.cond_group::before{content:'';position:absolute;left:19px;top:48px;bottom:18px;border-left:2px solid #b8d0e2}.group_head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;background:#eef5fa;border-bottom:1px solid #d7e5ef}.group_head h3{font-size:15px}.group_logic{display:flex;align-items:center;gap:8px}.group_logic select{width:auto;min-width:180px}.cond_rows{display:grid;gap:10px;padding:12px 12px 12px 44px}.cond_row{position:relative;background:#fff}.cond_row::before{content:'';position:absolute;left:-25px;top:50%;width:18px;border-top:2px solid #b8d0e2}.cond_row:not(:first-child)::after{content:attr(data-logic);position:absolute;left:-42px;top:-18px;background:#1769aa;color:#fff;border-radius:999px;font-size:11px;font-weight:800;padding:2px 6px}.cond_group_add{margin:0 12px 12px 44px}"
         ".muted{color:#666}.badge{font-size:12px;border-radius:999px;padding:2px 8px;background:#edf0f2;color:#333;white-space:nowrap}"
         ".on{background:#d7f4df;color:#125d25}.off{background:#eceff1;color:#4d555c}.warn{background:#ffe8c2;color:#6b4200}.rulewarn{border-left:4px solid #d18b00}.warntext{color:#6b4200;font-weight:600}"
         ".plan{background:#fff;border-left:4px solid #1769aa;padding:12px 14px;margin:10px 0 16px}"
-        ".sidebar-layout{display:grid;grid-template-columns:220px minmax(0,1fr);gap:18px;height:100%;min-height:0;overflow:hidden}"
-        ".sidebar{background:#fff;border:1px solid #d8dde2;border-radius:6px;padding:8px;overflow:auto;align-self:start;max-height:100%;box-sizing:border-box}"
+        ".sidebar-layout{display:grid;grid-template-columns:220px minmax(0,1fr);gap:18px;min-height:0}"
+        ".sidebar{position:sticky;top:calc(var(--header-h) + var(--nav-h) + 26px);background:#fff;border:1px solid #d8dde2;border-radius:6px;padding:8px;overflow:auto;align-self:start;max-height:calc(100vh - var(--header-h) - var(--nav-h) - var(--footer-h) - 52px);box-sizing:border-box}"
         ".sidebar button{display:block;width:100%;text-align:left;margin:0 0 4px;padding:9px 10px;background:#fff;border:0;border-radius:4px;cursor:pointer;box-shadow:none}"
         ".sidebar button.active{background:#e7f1f8;color:#0f4f82;font-weight:700}"
-        ".sidebar-content{overflow:auto;min-height:0;height:100%;box-sizing:border-box;padding:2px 8px 28px 2px;scrollbar-gutter:stable}.config-panel{display:none;width:100%;max-width:none}.config-panel.active{display:block}"
+        ".sidebar-content{min-height:0;box-sizing:border-box;padding:2px 8px 20px 2px}.config-panel{display:none;width:100%;max-width:none}.config-panel.active{display:block}"
         ".info-list{background:#fff;border:1px solid #d8dde2;border-radius:6px;padding:10px 14px;margin:8px 0 14px;line-height:1.45}"
         ".tablewrap{overflow:auto;background:#fff;border:1px solid #d8dde2;border-radius:6px;margin:10px 0 16px}"
         "table{width:100%;border-collapse:collapse;min-width:760px}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #e6e9ec;font-size:14px}th{background:#f1f3f5;font-weight:700}"
@@ -1189,14 +1185,14 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         ".doc{max-width:none}.doc p,.doc li{line-height:1.45}.doc code{background:#e9ecef;padding:1px 4px;border-radius:3px}"
         "pre{white-space:pre-wrap;background:#111;color:#e8e8e8;"
         "padding:14px;border-radius:6px;overflow:auto;font:13px/1.45 ui-monospace,Consolas,monospace}"
-        "#latest{min-height:42px;background:#fff;color:#171717;border:1px solid #ddd}"
+        "#latest{min-height:120px}"
         "#log{height:58vh;margin-top:0;width:70%;box-sizing:border-box}"
-        "@media(max-width:760px){:root{--header-h:66px;--nav-h:48px;--footer-h:28px}.tools{grid-template-columns:1fr 1fr}.check{align-self:center}.formline{grid-template-columns:1fr}.logicbar{display:grid;grid-template-columns:1fr auto}.logicbar select{grid-column:1/-1;max-width:none}.sidebar-layout{display:grid;grid-template-rows:auto minmax(0,1fr);grid-template-columns:1fr}.sidebar{display:flex;gap:6px;overflow:auto;margin-bottom:12px}.sidebar button{white-space:nowrap;width:auto}.sidebar-content{overflow:auto;height:100%;padding:2px 2px 28px}.cond_row,.trigger_row{grid-template-columns:1fr 80px}.cond_row .cond_value,.trigger_row .trig_action_on{grid-column:1}.cond_row button,.trigger_row button{grid-column:2}#log{width:100%}}"
+        "@media(max-width:760px){:root{--header-h:58px;--nav-h:48px;--footer-h:42px}.statusline{font-size:12px}.tools{grid-template-columns:1fr 1fr}.check{align-self:center}.formline,.sliderrow,.historytools{grid-template-columns:1fr}.logicbar{display:grid;grid-template-columns:1fr auto}.logicbar select{grid-column:1/-1;max-width:none}.sidebar-layout{display:grid;grid-template-rows:auto minmax(0,1fr);grid-template-columns:1fr}.sidebar{position:sticky;top:calc(var(--header-h) + var(--nav-h));display:flex;gap:6px;overflow:auto;margin-bottom:12px;max-height:none;z-index:2}.sidebar button{white-space:nowrap;width:auto}.sidebar-content{padding:2px 2px 20px}.cond_row,.trigger_row{grid-template-columns:1fr 80px}.cond_row .cond_value,.trigger_row .trig_action_on{grid-column:1}.cond_row button,.trigger_row button{grid-column:2}#log{width:100%}footer{font-size:12px;gap:10px}}"
         "button{font-size:15px;padding:8px 12px;margin:0 8px 12px 0;border:1px solid #c6d0d9;border-radius:6px;background:#fff;color:#17212b;cursor:pointer;box-shadow:0 1px 2px #0001;transition:background .15s,border-color .15s,box-shadow .15s}"
         "button:hover:not(:disabled){background:#f1f6fa;border-color:#9fb4c6;box-shadow:0 2px 6px #0002}button:active:not(:disabled){background:#e5eef5;box-shadow:inset 0 1px 3px #0002}"
         "button:disabled{opacity:.5;cursor:not-allowed;box-shadow:none}.primary{background:#1769aa;border-color:#1769aa;color:#fff}.primary:hover:not(:disabled){background:#10578f;border-color:#10578f}.danger{border-color:#d1a0a0;color:#8a1f1f}.danger:hover:not(:disabled){background:#fff1f1;border-color:#bd7777}"
         "</style></head><body>"
-        "<header><h1>Bosch LDI</h1><div class=meta>Host: boschldi.local</div></header>"
+        "<header><h1>Bosch LDI</h1><div class=statusline><span id=conn_dot class=statusdot></span><span id=conn_text>Bike disconnected</span><span class=statussep>|</span><span id=online_text>Offline</span></div></header>"
         "<nav><button class='tabbtn active' data-tab=bike onclick=\"showTab('bike')\">Bike data</button>"
         "<button class=tabbtn data-tab=logs onclick=\"showTab('logs')\">Logs</button>"
         "<button class=tabbtn data-tab=hue onclick=\"showTab('hue')\">Hue</button>"
@@ -1218,33 +1214,31 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<div class=formline><label>Cooldown seconds</label><input id=auto_cooldown_sec name=cooldown_sec type=number min=5 max=3600 value=30></div>"
         "<label class=check><input id=auto_enabled name=enabled type=checkbox checked>Enabled</label>"
         "<button class=primary type=submit>Save automation</button></form></div></div>"
-        "<main><section id=bike class='tab active'><button class=primary onclick=load()>Refresh</button>"
-        "<button onclick=\"location.href='/bike-log'\">Bike file</button>"
-        "<button onclick=\"location.href='/bike-log/previous'\">Previous file</button>"
-        "<div class=label>Latest bike state</div><pre id=latest>Loading...</pre></section>"
-        "<section id=logs class=tab><button class=primary onclick=load()>Refresh</button>"
-        "<button onclick=\"location.href='/api/logs'\">Logs JSON</button>"
-        "<button onclick=\"location.href='/logs'\">Raw runtime logs</button>"
-        "<div class=label>Runtime logs</div><div class=tools>"
+        "<main><section id=bike class='tab active'><div class=label>Latest bike state</div><div id=latest>Loading...</div>"
+        "<div class=historypanel><div class=row><div><div class=label>Historical bike data</div><div id=history_summary class=historysummary>Loading history...</div></div></div>"
+        "<div class=historytools><label>Field<select id=history_field onchange=loadHistory(true)></select></label><div class=hint>Values are read from the ESP32 rotating binary ring and are shown only for fields actually sent by the bike.</div></div>"
+        "<div id=history_chart class=chartbox></div><div id=history_table class='tablewrap historytable'></div></div></section>"
+        "<section id=logs class=tab><div class=label>Runtime logs</div><div class=tools>"
         "<input id=q placeholder=Search oninput=renderLogs()>"
         "<select id=level onchange=renderLogs()><option value=''>All levels</option><option value=E>Errors</option>"
         "<option value=W>Warnings</option><option value=I>Info</option><option value=D>Debug</option></select>"
-        "<input id=tag placeholder='Filter source' oninput=renderLogs()>"
+        "<select id=tag title='ESP log source tag, for example wifi_admin or gatt_client' onchange=renderLogs()><option value=''>All sources</option></select>"
         "<label class=check><input id=follow type=checkbox checked>Follow</label></div>"
         "<div id=count class=count>0 lines</div><pre id=log>Loading...</pre></section>"
         "<section id=config class=tab><div class=sidebar-layout><aside class=sidebar>"
         "<button class=active data-config-panel=device onclick=\"showConfigPanel('device')\">Device</button>"
         "<button data-config-panel=push onclick=\"showConfigPanel('push')\">Push service</button>"
-        "<button data-config-panel=mqtt onclick=\"showConfigPanel('mqtt')\">MQTT service</button></aside>"
+        "<button data-config-panel=mqtt onclick=\"showConfigPanel('mqtt')\">MQTT service</button>"
+        "<button data-config-panel=firmware onclick=\"showConfigPanel('firmware')\">Firmware</button></aside>"
         "<div class=sidebar-content><div id=config_device class='config-panel active'>"
         "<div class=label>Accessory device name</div>"
         "<form class=wifi method=post action=/device-name onsubmit=\"return postFormToast(event,'Device name saved','Device name save failed')\">"
         "<label>Name shown to the bike</label><input id=device_name name=device_name maxlength=24>"
         "<button type=submit>Save name</button></form>"
-        "<div class=label>Internal RGB LED</div><form class=wifi method=post action=/led-config onsubmit=\"return postFormToast(event,'LED settings saved','LED settings save failed')\">"
-        "<label class=check><input id=led_enabled name=led_enabled type=checkbox value=1>Enabled</label>"
-        "<label>Brightness percent</label><input id=led_brightness_percent name=led_brightness_percent type=number min=1 max=100>"
-        "<button type=submit>Save LED</button></form>"
+        "<div class=label>Internal RGB LED</div><form id=led_form class=wifi method=post action=/led-config onsubmit=\"return false\">"
+        "<label class=check><input id=led_enabled name=led_enabled type=checkbox value=1 onchange=scheduleLedSave()>Enabled</label>"
+        "<div class=sliderrow><label for=led_brightness_percent>Brightness</label><div class=sliderwrap><input id=led_brightness_percent name=led_brightness_percent type=range min=1 max=100 oninput=ledBrightnessChanged()></div><span id=led_brightness_value class=valuepill>20%</span></div>"
+        "<div id=led_save_status class=autosave></div></form>"
         "<div class=hint>LED meanings: grey boot, blue bike pairing, yellow bike connected, cyan secured, green live data ready, white bike data activity, red error.</div>"
         "<div class=label>Wi-Fi</div><div id=wifi_status class=hint>Loading Wi-Fi status...</div>"
         "<button id=wifi_change_btn onclick=showWifiChange()>Change Wi-Fi</button>"
@@ -1269,7 +1263,12 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<label>Discovery prefix</label><input id=ha_discovery_prefix name=ha_discovery_prefix maxlength=31>"
         "<label>Topic base</label><input id=ha_topic_base name=ha_topic_base maxlength=63>"
         "<label>Publish interval seconds</label><input id=ha_interval_sec name=ha_interval_sec type=number min=2 max=3600>"
-        "<button type=submit>Save MQTT service</button></form></div></div></div>"
+        "<button type=submit>Save MQTT service</button></form></div>"
+        "<div id=config_firmware class=config-panel><div class=label>Firmware update</div>"
+        "<form class=wifi onsubmit='return uploadOta(event)'>"
+        "<label>Firmware .bin</label><input id=ota_file type=file accept='.bin,application/octet-stream' required>"
+        "<button class=primary type=submit>Upload and reboot</button></form>"
+        "<div id=ota_msg class=hint>Use the PlatformIO app binary. A full flash is required once after installing this OTA partition layout.</div></div></div></div>"
         "</section><section id=hue class=tab><div class=label>Philips Hue</div>"
         "<div id=hue_status class=hint>Loading Hue status...</div>"
         "<div id=hue_actions class=actions><button id=hue_discover_btn onclick=discoverHue()>Discover Bridges</button></div>"
@@ -1284,6 +1283,7 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<p>The web UI is served by the ESP over Wi-Fi. The network hostname stays <code>boschldi.local</code>. If saved Wi-Fi is unavailable, the setup access point starts and the setup page is available at <code>192.168.4.1</code>.</p>"
         "<div class=label>Read APIs</div><ul>"
         "<li><code>GET /api/bike</code> latest decoded bike state as JSON, including last update metadata and unknown field IDs when present.</li>"
+        "<li><code>GET /api/bike/history?field=6</code> latest bounded history points for one bike field. Field IDs match the compact history map.</li>"
         "<li><code>GET /api/logs</code> runtime log ring as JSON.</li>"
         "<li><code>GET /api/state</code> bike state and runtime logs in one JSON response.</li>"
         "<li><code>GET /api/automation/rules</code> current bike-to-Hue rules.</li>"
@@ -1297,9 +1297,7 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<li><code>POST /api/hue/light/state</code> form fields <code>light_id</code> and <code>on</code>; internal automation action endpoint.</li>"
         "<li><code>GET /api/hue/resources</code> full Hue v1 bridge state for debugging.</li>"
         "<li><code>GET /config</code> current device name, push export, LED, and Wi-Fi settings.</li>"
-        "<li><code>GET /scan</code> nearby Wi-Fi networks.</li>"
-        "<li><code>GET /bike-log</code> current rotated persistent bike log.</li>"
-        "<li><code>GET /bike-log/previous</code> previous rotated persistent bike log.</li></ul>"
+        "<li><code>GET /scan</code> nearby Wi-Fi networks.</li></ul>"
         "<div class=label>Configuration APIs</div><ul>"
         "<li><code>POST /device-name</code> form field <code>device_name</code>. Changes the BLE accessory name shown to the bike, not DNS.</li>"
         "<li><code>POST /save</code> form fields <code>ssid</code> and <code>pass</code>. Tries the new Wi-Fi without reboot, saves only after success, and falls back to the previous saved Wi-Fi on failure.</li>"
@@ -1309,33 +1307,66 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "<li><code>POST /api/automation/rule/update?index=N</code> replaces an existing rule with a JSON payload.</li>"
         "<li><code>POST /api/automation/rule/enabled</code> form fields <code>index</code> and <code>enabled</code>.</li>"
         "<li><code>POST /api/automation/rule/delete</code> form field <code>index</code>.</li>"
-        "<li><code>POST /api/automation/clear</code> removes all automation rules.</li></ul>"
+        "<li><code>POST /api/automation/clear</code> removes all automation rules.</li>"
+        "<li><code>POST /ota</code> raw firmware <code>.bin</code> body. Writes to the next OTA partition and reboots on success.</li></ul>"
         "<div class=label>Polling</div><p>Clients can poll <code>/api/bike</code> every 1-2 seconds. Poll <code>/api/logs</code> only while a user is watching logs. Push export remains optional and bounded by firmware interval limits.</p>"
         "<div class=label>Home Assistant</div><p>Enable MQTT Discovery in Home Assistant and enter the broker connection here. The ESP publishes retained discovery configs below <code>homeassistant/</code> by default, availability to <code>boschldi/status</code>, and latest bike JSON to <code>boschldi/state</code>. Home Assistant creates entities from the JSON fields; no Home Assistant REST token is stored on the ESP.</p>"
-        "</section></main><footer></footer>"
-        "<script>let rawLogs='';let huePaired=false;function validTab(id){return !!document.getElementById(id)&&document.getElementById(id).classList.contains('tab')}"
+        "</section></main><footer><span id=footer_connection>Last bike connection: never</span><span id=footer_update>Last bike update: never</span></footer>"
+        "<script>let rawLogs='';let huePaired=false;let previousBikeValues={},bikeRenderSeen=false;function validTab(id){return !!document.getElementById(id)&&document.getElementById(id).classList.contains('tab')}"
         "function currentTab(){let id=(location.hash||'#bike').slice(1);return validTab(id)?id:'bike'}"
         "function showTab(id,push){if(!validTab(id))id='bike';document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.id==id));"
         "document.querySelectorAll('.tabbtn').forEach(x=>x.classList.toggle('active',x.dataset.tab==id));if(push!==false&&location.hash!='#'+id)history.pushState(null,'','#'+id);"
-        "if(id=='logs')renderLogs();if(id=='config')loadConfig();if(id=='hue'){loadHueStatus();if(huePaired)loadHueDevices(false)}if(id=='automation')loadAutomation()}"
+        "if(id=='bike')loadHistory(false);if(id=='logs')loadLogs();if(id=='config')loadConfig();if(id=='hue'){loadHueStatus();if(huePaired)loadHueDevices(false)}if(id=='automation')loadAutomation()}"
         "function showConfigPanel(id){document.querySelectorAll('.config-panel').forEach(x=>x.classList.toggle('active',x.id=='config_'+id));document.querySelectorAll('[data-config-panel]').forEach(x=>x.classList.toggle('active',x.dataset.configPanel==id))}"
         "window.addEventListener('popstate',()=>showTab(currentTab(),false));window.addEventListener('hashchange',()=>showTab(currentTab(),false));"
         "function logLevel(x){let m=x.match(/^[EWIDV]\\s*\\(/);if(m)return m[0][0];"
         "m=x.match(/\\b(error|warn|info|debug)\\b/i);return m?m[1][0].toUpperCase():''}"
-        "function logTag(x){let m=x.match(/^[EWIDV]\\s*\\([^)]*\\)\\s+([^:]+):/);return m?m[1].toLowerCase():x.toLowerCase()}"
+        "function logTag(x){let m=x.match(/^[EWIDV]\\s*\\([^)]*\\)\\s+([^:]+):/);return m?m[1].toLowerCase():''}"
+        "function logTagLabel(x){let m=x.match(/^[EWIDV]\\s*\\([^)]*\\)\\s+([^:]+):/);return m?m[1]:''}"
+        "function updateLogSources(lines){let s=document.getElementById('tag'),old=s.value,map={};lines.forEach(x=>{let k=logTag(x),v=logTagLabel(x);if(k&&!map[k])map[k]=v});"
+        "let keys=Object.keys(map).sort((a,b)=>map[a].localeCompare(map[b]));let sig=keys.join('|');if(s.dataset.sig==sig)return;if(old&&!map[old])old='';"
+        "s.innerHTML='<option value=\"\">All sources</option>';keys.forEach(k=>{let o=document.createElement('option');o.value=k;o.textContent=map[k];s.appendChild(o)});s.value=old;s.dataset.sig=sig}"
         "function renderLogs(){let e=document.getElementById('log'),q=document.getElementById('q').value.toLowerCase(),"
-        "lv=document.getElementById('level').value,t=document.getElementById('tag').value.toLowerCase();"
-        "let lines=rawLogs.replace(/\\r/g,'\\n').split('\\n').filter(x=>x.length);let shown=lines.filter(x=>(!q||x.toLowerCase().includes(q))&&"
+        "lv=document.getElementById('level').value;let lines=rawLogs.replace(/\\r/g,'\\n').split('\\n').filter(x=>x.length);updateLogSources(lines);let t=document.getElementById('tag').value;"
+        "let shown=lines.filter(x=>(!q||x.toLowerCase().includes(q))&&"
         "(!lv||logLevel(x)==lv)&&(!t||logTag(x).includes(t)));"
         "e.textContent=shown.join('\\n')||(rawLogs?'No matching log lines.':'No runtime logs yet.');"
         "e.className=shown.length?'':'empty';document.getElementById('count').textContent=shown.length+' / '+lines.length+' lines';"
         "if(document.getElementById('follow').checked)e.scrollTop=e.scrollHeight}"
-        "async function load(){let l=document.getElementById('latest');"
-        "try{let r=await fetch('/api/bike',{cache:'no-store'});let b=await r.json();"
-        "l.textContent=b.has_data?JSON.stringify(b.data,null,2):'No bike data received yet.'}"
-        "catch(x){l.textContent='Could not load latest state'}"
+        "let bikeConnected=false,lastBikeConnectionAt='',currentWifiSsid='';"
+        "function formatDateTime(v){if(!v)return 'never';let d=typeof v==='number'?new Date(v*1000):new Date(v);return isNaN(d.getTime())?'never':d.toLocaleString()}"
+        "function setConnectionStatus(connected,online,ssid){if(ssid!==undefined)currentWifiSsid=ssid||'';if(connected&&!bikeConnected)lastBikeConnectionAt=new Date().toISOString();bikeConnected=!!connected;let wifi=currentWifiSsid?' ('+currentWifiSsid+')':'';document.getElementById('conn_dot').classList.toggle('ok',!!(bikeConnected&&online));document.getElementById('conn_text').textContent=bikeConnected?'Bike connected':'Bike disconnected';document.getElementById('online_text').textContent=(online?'Online':'Offline')+wifi;document.getElementById('footer_connection').textContent='Last bike connection: '+(lastBikeConnectionAt?formatDateTime(lastBikeConnectionAt):(bikeConnected?'now':'never'))}"
+        "function hasBikeValue(v){return !(v===undefined||v===null||v==='')}"
+        "function formatNumber(v,dec){let n=Number(v);if(!isFinite(n))return String(v);return n.toLocaleString(undefined,{maximumFractionDigits:dec,minimumFractionDigits:dec})}"
+        "function formatBikeDisplay(f,v){let unit=f[3]||'',kind=f[4]||'raw';if(!hasBikeValue(v))return unit?'- '+unit:'-';"
+        "if(kind=='bool')return v===true||v===1||v==='1'?'Yes':'No';if(kind=='light')return String(v)=='on'||v===2||v==='2'?'On':(String(v)=='off'||v===1||v==='1'?'Off':String(v));"
+        "if(kind=='date')return String(v);if(kind=='unix')return formatNumber(v,0)+' s';if(kind=='int')return formatNumber(v,0)+(unit?' '+unit:'');"
+        "if(kind=='dec1')return formatNumber(v,1)+(unit?' '+unit:'');if(kind=='dec2')return formatNumber(v,2)+(unit?' '+unit:'');if(kind=='dec3')return formatNumber(v,3)+(unit?' '+unit:'');"
+        "return String(v)+(unit?' '+unit:'')}"
+        "function normalizedBikeValueForField(f,v){return formatBikeDisplay(f,v)}"
+        "function bikeValueHtml(f,v){let n=formatBikeDisplay(f,v);return '<span class=\"bikevalue '+(!hasBikeValue(v)?'empty':'')+'\">'+escapeHtml(n)+'</span>'}"
+        "function bikeFieldCard(f,data,changed){let k=f[0],name=f[1],info=f[2],i=changed.indexOf(k),style=i>=0?' style=\"--flash-delay:'+(i*45)+'ms\"':'';return '<div class=\"bikeitem '+(i>=0?'changed':'')+'\"'+style+'><div class=bikehead><div><div class=bikename>'+escapeHtml(name)+' <span class=fieldkey>('+escapeHtml(k)+')</span></div></div><span class=infobadge title=\"'+escapeHtml(info)+'\" aria-label=\"'+escapeHtml(info)+'\">i</span></div>'+bikeValueHtml(f,data[k])+'</div>'}"
+        "let historyRecords=[],historyLoadedAt=0,historyLoadedField='';const historyFieldMap={1:['time','Bike timestamp','s','unix',1],2:['speed_kmh','Speed','km/h','dec1',0.01],3:['cadence_rpm','Cadence','rpm','int',1],4:['rider_power_w','Rider power','W','int',1],5:['ambient_brightness_lux','Ambient brightness','lux','dec1',0.001],6:['battery_soc','Battery','%','int',1],7:['odometer_m','Odometer','m','int',1],8:['bike_light','Bike light','','light',1],9:['system_locked','System locked','','bool',1],10:['charger_connected','Charger connected','','bool',1],11:['light_reserve_state','Light reserve','','bool',1],12:['diagnosis_program_active','Diagnosis active','','bool',1],13:['bike_not_driving','Bike not moving','','bool',1]};"
+        "function historyFieldId(field){for(let id in historyFieldMap)if(historyFieldMap[id][0]==field)return id;return '6'}"
+        "function setupHistoryOptions(){let sel=document.getElementById('history_field');if(sel.options.length)return;sel.innerHTML=Object.keys(historyFieldMap).map(id=>'<option value=\"'+historyFieldMap[id][0]+'\">'+escapeHtml(historyFieldMap[id][1])+'</option>').join('');sel.value='battery_soc'}"
+        "function historyValue(raw,type,scale){let v=type==3?!!raw:raw;return typeof v=='number'?v*scale:v}"
+        "function decodeHistory(j,field){let id=String(j&&j.field_id||historyFieldId(field)),m=historyFieldMap[id]||historyFieldMap[6];return (j.records||[]).map(r=>({ts:r[0],field:m[0],name:m[1],unit:m[2],kind:m[3],value:historyValue(r[1],r[2],m[4])}))}"
+        "function historyDisplay(field,v){let f=bikeFields.find(x=>x[0]==field)||Object.values(historyFieldMap).find(x=>x[0]==field)||[field,field,'','raw'];return formatBikeDisplay(f,v)}"
+        "function renderHistory(){let sel=document.getElementById('history_field'),field=sel.value,box=document.getElementById('history_chart'),tbl=document.getElementById('history_table'),rows=historyRecords.filter(r=>r.field==field);if(!rows.length){box.innerHTML='<div class=hint style=\"padding:14px\">No historical values for this field yet.</div>';tbl.innerHTML='';return}let vals=rows.map(r=>typeof r.value=='boolean'?(r.value?1:0):Number(r.value)).filter(Number.isFinite),min=Math.min(...vals),max=Math.max(...vals);if(min==max){min-=1;max+=1}let w=720,h=240,p=34,step=Math.max(1,Math.ceil(rows.length/420)),pts=rows.filter((_,i)=>i%step==0||i==rows.length-1),t0=rows[0].ts,t1=rows[rows.length-1].ts||t0+1;let xy=pts.map(r=>{let v=typeof r.value=='boolean'?(r.value?1:0):Number(r.value),x=p+((r.ts-t0)/Math.max(1,t1-t0))*(w-p*2),y=h-p-((v-min)/(max-min))*(h-p*2);return [x,y,r]});let line=xy.map(p=>p[0].toFixed(1)+','+p[1].toFixed(1)).join(' '),area=line?('M'+xy[0][0].toFixed(1)+','+(h-p)+' L'+line.replaceAll(' ',', L')+' L'+xy[xy.length-1][0].toFixed(1)+','+(h-p)+' Z'):'';let latest=rows[rows.length-1];box.innerHTML='<svg viewBox=\"0 0 '+w+' '+h+'\" preserveAspectRatio=\"none\"><line class=chartgrid x1='+p+' y1='+p+' x2='+p+' y2='+(h-p)+'></line><line class=chartgrid x1='+p+' y1='+(h-p)+' x2='+(w-p)+' y2='+(h-p)+'></line><path class=chartarea d=\"'+area+'\"></path><polyline class=chartline points=\"'+line+'\"></polyline><text class=chartlabel x='+(p+4)+' y='+(p+14)+'>'+escapeHtml(historyDisplay(field,max))+'</text><text class=chartlabel x='+(p+4)+' y='+(h-p-6)+'>'+escapeHtml(historyDisplay(field,min))+'</text></svg>';let last=rows.slice(-40).reverse();tbl.innerHTML='<table><thead><tr><th>Time</th><th>Value</th></tr></thead><tbody>'+last.map(r=>'<tr><td>'+escapeHtml(formatDateTime(r.ts))+'</td><td>'+escapeHtml(historyDisplay(field,r.value))+'</td></tr>').join('')+'</tbody></table>';document.getElementById('history_summary').innerHTML='<span class=badge>'+rows.length+' samples</span><span>Latest: '+escapeHtml(historyDisplay(field,latest.value))+'</span><span>'+escapeHtml(formatDateTime(rows[0].ts))+' - '+escapeHtml(formatDateTime(latest.ts))+'</span>'}"
+        "async function loadHistory(force){setupHistoryOptions();let field=document.getElementById('history_field').value||'battery_soc';if(!force&&historyLoadedField==field&&Date.now()-historyLoadedAt<15000)return;let s=document.getElementById('history_summary');try{let r=await fetch('/api/bike/history?field='+encodeURIComponent(historyFieldId(field)),{cache:'no-store'});let j=await r.json();historyRecords=decodeHistory(j,field);historyLoadedAt=Date.now();historyLoadedField=field;s.textContent=historyRecords.length?'Stored '+historyRecords.length+' recent samples for this field.':'No historical values for this field yet.';renderHistory()}catch(e){s.textContent='Could not load historical bike data';document.getElementById('history_chart').innerHTML='';document.getElementById('history_table').innerHTML=''}}"
+        "function renderBikeState(b){let l=document.getElementById('latest'),data=(b&&b.data)||{},known=new Set(bikeFields.map(f=>f[0]));let unknown=Object.keys(data).filter(k=>!known.has(k)).sort();"
+        "let status=(b&&b.has_data)?'Last received bike values.':'No bike data received yet; waiting for the first Live Data update.';"
+        "let fieldByKey={};bikeFields.forEach(f=>fieldByKey[f[0]]=f);let keys=bikeFields.map(f=>f[0]).concat(unknown),changed=[];keys.forEach(k=>{let f=fieldByKey[k]||[k,'Unknown field','Field received from the bike but not yet known by this firmware.','','raw'];let v=normalizedBikeValueForField(f,data[k]);if(bikeRenderSeen&&previousBikeValues[k]!==v)changed.push(k);previousBikeValues[k]=v});bikeRenderSeen=true;"
+        "let cards=bikeFields.map(f=>bikeFieldCard(f,data,changed)).join('')+unknown.map(k=>bikeFieldCard([k,'Unknown field','Field received from the bike but not yet known by this firmware.'],data,changed)).join('');"
+        "setConnectionStatus(!!(b&&b.bike_connected),true);document.getElementById('footer_update').textContent='Last bike update: '+formatDateTime(data.last_update_iso_utc||data.last_update_unix_time);"
+        "l.innerHTML='<div class=bikebar><span>'+escapeHtml(status)+'</span><span class=badge>'+bikeFields.length+' known fields'+(unknown.length?' + '+unknown.length+' unknown':'')+'</span></div><div class=bikegrid>'+cards+'</div>'}"
+        "async function loadBike(){let l=document.getElementById('latest');"
+        "try{let r=await fetch('/api/bike',{cache:'no-store'});let b=await r.json();renderBikeState(b)}"
+        "catch(x){l.textContent='Could not load latest state';setConnectionStatus(false,false)}}"
+        "async function loadLogs(){"
         "try{let r=await fetch('/api/logs',{cache:'no-store'});let j=await r.json();rawLogs=j.logs||'';renderLogs()}"
         "catch(x){rawLogs='';document.getElementById('log').textContent='Could not load logs'}}"
+        "async function load(){await loadBike();if(currentTab()=='bike')await loadHistory(false);if(currentTab()=='logs')await loadLogs()}"
         "async function scan(){let s=document.getElementById('ssid');document.getElementById('wifi_msg').textContent='Scanning nearby networks...';try{let r=await fetch('/scan',{cache:'no-store'});"
         "let a=await r.json();s.innerHTML='';a.forEach(n=>{let o=document.createElement('option');"
         "o.value=n.ssid;o.textContent=n.ssid+' ('+n.rssi+' dBm)';s.appendChild(o)});"
@@ -1345,8 +1376,15 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "async function submitWifiChange(ev){ev.preventDefault();let f=ev.target,s=document.getElementById('ssid').value;"
         "if(!confirm('The ESP32 will now leave the current Wi-Fi and try '+s+'. If it cannot connect, it will fall back to the previous saved Wi-Fi. Continue?'))return false;"
         "try{let r=await fetch(f.action,{method:'POST',body:new URLSearchParams(new FormData(f))});if(!r.ok)throw new Error('HTTP '+r.status);showToast('Wi-Fi change submitted','ok',3000);document.getElementById('wifi_msg').textContent='Trying new Wi-Fi. If it fails, the ESP will fall back.';setTimeout(loadConfig,2500)}catch(e){showToast('Wi-Fi change failed','error');document.getElementById('wifi_msg').textContent='Wi-Fi change failed.'}return false}"
+        "async function uploadOta(ev){ev.preventDefault();let f=document.getElementById('ota_file').files[0],m=document.getElementById('ota_msg');if(!f){showToast('Select a firmware .bin first','error');return false}if(!confirm('Upload firmware '+f.name+' and reboot the ESP32 after success?'))return false;m.textContent='Uploading firmware... keep this page open.';try{let r=await fetch('/ota',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f});let j=await r.json();m.textContent=JSON.stringify(j,null,2);if(!r.ok||!j.updated)throw new Error(j.error||'OTA failed');showToast('Firmware uploaded; ESP32 is rebooting','ok',5000)}catch(e){m.textContent='OTA update failed: '+e.message;showToast('OTA update failed: '+e.message,'error',7000)}return false}"
         "async function postFormToast(ev,okMsg,failMsg){ev.preventDefault();let f=ev.target;try{let r=await fetch(f.action,{method:'POST',body:new URLSearchParams(new FormData(f))});if(!r.ok)throw new Error('HTTP '+r.status);showToast(okMsg,'ok',3000);setTimeout(loadConfig,600)}catch(e){showToast(failMsg,'error')}return false}"
+        "let ledSaveTimer=null,ledLoading=false;function setLedBrightnessValue(v){document.getElementById('led_brightness_value').textContent=(v||20)+'%'}"
+        "function ledBrightnessChanged(){setLedBrightnessValue(document.getElementById('led_brightness_percent').value);scheduleLedSave()}"
+        "function scheduleLedSave(){if(ledLoading)return;let s=document.getElementById('led_save_status');s.textContent='Saving soon...';if(ledSaveTimer)clearTimeout(ledSaveTimer);ledSaveTimer=setTimeout(saveLedConfig,800)}"
+        "async function saveLedConfig(){let f=document.getElementById('led_form'),s=document.getElementById('led_save_status');try{s.textContent='Saving...';let r=await fetch(f.action,{method:'POST',body:new URLSearchParams(new FormData(f))});if(!r.ok)throw new Error('HTTP '+r.status);s.textContent='Saved';setTimeout(()=>{if(s.textContent=='Saved')s.textContent=''},1800)}catch(e){s.textContent='Save failed';showToast('LED settings save failed','error')}}"
         "async function loadConfig(){try{let r=await fetch('/config',{cache:'no-store'});let c=await r.json();"
+        "ledLoading=true;"
+        "setConnectionStatus(bikeConnected,true,c.wifi_connected?c.current_ssid:'');"
         "document.getElementById('device_name').value=c.device_name||'';"
         "document.getElementById('wifi_status').textContent=c.wifi_connected?'Connected to Wi-Fi: '+c.current_ssid:'Wi-Fi is not connected. Saved network: '+(c.saved_ssid||'none');"
         "document.getElementById('logs_url').value=c.logs_url||'';document.getElementById('bike_url').value=c.bike_url||'';"
@@ -1358,7 +1396,7 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "document.getElementById('ha_discovery_prefix').value=c.ha_discovery_prefix||'homeassistant';document.getElementById('ha_topic_base').value=c.ha_topic_base||'boschldi';"
         "let hi=document.getElementById('ha_interval_sec');hi.min=c.ha_min_interval_sec||2;hi.max=c.ha_max_interval_sec||3600;hi.value=c.ha_interval_sec||5;"
         "document.getElementById('led_enabled').checked=!!c.led_enabled;"
-        "document.getElementById('led_brightness_percent').value=c.led_brightness_percent||20;}catch(e){}}"
+        "let lb=c.led_brightness_percent||20;document.getElementById('led_brightness_percent').value=lb;setLedBrightnessValue(lb);ledLoading=false;}catch(e){ledLoading=false;setConnectionStatus(false,false)}}"
         "let hueBridgeCards=[],lastHueDevices={},hueDevicesAvailable=false,hueDevicesCached=false,hueDevicesLoadedAt=0;"
         "async function loadHueStatus(force){if(!force&&loadHueStatus.last&&Date.now()-loadHueStatus.last<10000)return;try{let r=await fetch('/api/hue/status',{cache:'no-store'});let j=await r.json();loadHueStatus.last=Date.now();huePaired=!!j.paired;"
         "document.getElementById('automation_tab_btn').style.display=huePaired?'block':'none';"
@@ -1412,7 +1450,7 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "catch(e){hueDevicesAvailable=false;hueDevicesCached=Object.keys(lastHueDevices||{}).length>0;h.textContent=hueDevicesCached?'Hue device refresh failed; using browser cache.':'Hue device load failed';showToast(h.textContent,'error');updateAutomationWarningFlags();return {data:lastHueDevices,available:false,cached:hueDevicesCached}}}"
         "async function showHueDevicesModal(){openModal('devices_modal');await loadHueDevices()}"
         "function closeHueDevicesModal(){document.getElementById('devices_modal').classList.remove('open')}"
-        "const bikeFields=[['speed_kmh','Speed km/h','Current bike speed in kilometres per hour.'],['cadence_rpm','Cadence rpm','Pedalling cadence.'],['rider_power_w','Rider power W','Rider power contribution in watts.'],['ambient_brightness_lux','Ambient brightness lux','Brightness measured by the bike system.'],['battery_soc','Battery %','Main battery state of charge.'],['odometer_m','Odometer m','Total distance in metres.'],['bike_light','Bike light','1 means off, 2 means on.'],['system_locked','System locked','1 means the bike reports locked.'],['charger_connected','Charger connected','1 means charger connected.'],['light_reserve_state','Light reserve','Bike light reserve state as numeric value.'],['diagnosis_program_active','Diagnosis active','1 means diagnostic mode active.'],['bike_not_driving','Bike not moving','1 means the bike reports not driving.']];"
+        "const bikeFields=[['last_update_iso_utc','Last update','ISO UTC date/time reported by the bike data timestamp.','','date'],['last_update_unix_time','Last update','UNIX timestamp reported by the bike data timestamp.','s','unix'],['time','Bike timestamp','Raw UNIX timestamp field received from the bike.','s','unix'],['speed_kmh','Speed','Current bike speed.','km/h','dec1'],['cadence_rpm','Cadence','Pedalling cadence.','rpm','int'],['rider_power_w','Rider power','Rider power contribution.','W','int'],['ambient_brightness_lux','Ambient brightness','Brightness measured by the bike system.','lux','dec1'],['battery_soc','Battery','Main battery state of charge.','%','int'],['odometer_m','Odometer','Total distance.','m','int'],['bike_light','Bike light','Bike light state.','','light'],['system_locked','System locked','Whether the bike reports locked.','','bool'],['charger_connected','Charger connected','Whether a charger is connected.','','bool'],['light_reserve_state','Light reserve','Bike light reserve state.','','bool'],['diagnosis_program_active','Diagnosis active','Whether diagnostic mode is active.','','bool'],['bike_not_driving','Bike not moving','Whether the bike reports not driving.','','bool']];"
         "function fieldOptions(){return bikeFields.map(f=>'<option value=\"'+f[0]+'\">'+f[1]+'</option>').join('')}"
         "function updateFieldHelp(sel){let f=bikeFields.find(x=>x[0]==sel.value);document.getElementById('auto_field_help').textContent=f?f[1]+': '+f[2]:'Select a bike field.'}"
         "function conditionHtml(c){return '<strong>'+escapeHtml(c.field)+'</strong> '+escapeHtml(c.op)+' '+Number(c.value).toFixed(3)}"
@@ -1445,11 +1483,19 @@ static esp_err_t dashboard_root_get_handler(httpd_req_t *req)
         "async function clearHue(){let h=document.getElementById('hue_output');h.textContent='Clearing Hue pairing...';"
         "try{let r=await fetch('/api/hue/clear',{method:'POST'});let j=await r.json();h.textContent=JSON.stringify(j,null,2);huePaired=false;hueBridgeCards=[];lastHueDevices={};hueDevicesAvailable=false;hueDevicesCached=false;hueDevicesLoadedAt=0;document.getElementById('automation_tab_btn').style.display='none';document.getElementById('hue_discover_btn').style.display='inline-block';document.getElementById('hue_cards').innerHTML='';document.getElementById('hue_devices_modal').innerHTML='';showToast('Hue Bridge disconnected','ok',3000)}"
         "catch(e){h.textContent='Hue pairing clear failed';showToast('Hue pairing clear failed')}}"
-        "showTab(currentTab(),false);load();loadConfig();loadHueStatus();setInterval(load,3000)</script>"
+        "showTab(currentTab(),false);load();loadConfig();loadHueStatus();setInterval(()=>{loadBike();if(currentTab()=='bike')loadHistory(false)},5000);setInterval(()=>{if(currentTab()=='logs')loadLogs()},2000)</script>"
         "</body></html>";
 
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+    if (wifi_admin_is_connected()) {
+        return dashboard_root_get_handler(req);
+    }
+    return setup_root_get_handler(req);
 }
 
 static esp_err_t scan_get_handler(httpd_req_t *req)
@@ -1786,6 +1832,100 @@ static esp_err_t led_config_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "LED configuration saved.");
 }
 
+static void ota_restart_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    esp_restart();
+}
+
+static esp_err_t ota_post_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+
+    if (req->content_len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"type\":\"ota\",\"updated\":false,\"error\":\"empty firmware body\"}");
+    }
+
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"type\":\"ota\",\"updated\":false,\"error\":\"no OTA partition\"}");
+    }
+    if ((uint32_t)req->content_len > update_partition->size) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        return httpd_resp_sendstr(req, "{\"type\":\"ota\",\"updated\":false,\"error\":\"firmware too large\"}");
+    }
+
+    char *buffer = malloc(WIFI_ADMIN_OTA_CHUNK_SIZE);
+    if (buffer == NULL) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"type\":\"ota\",\"updated\":false,\"error\":\"allocation failed\"}");
+    }
+
+    esp_ota_handle_t ota_handle = 0;
+    esp_err_t err = esp_ota_begin(update_partition, req->content_len, &ota_handle);
+    if (err != ESP_OK) {
+        free(buffer);
+        ESP_LOGE(TAG, "OTA begin failed partition=%s err=%s",
+                 update_partition->label, esp_err_to_name(err));
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"type\":\"ota\",\"updated\":false,\"error\":\"OTA begin failed\"}");
+    }
+
+    int remaining = req->content_len;
+    int received = 0;
+    while (remaining > 0) {
+        int to_read = remaining > WIFI_ADMIN_OTA_CHUNK_SIZE ?
+                      WIFI_ADMIN_OTA_CHUNK_SIZE : remaining;
+        int read_len = httpd_req_recv(req, buffer, to_read);
+        if (read_len == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (read_len <= 0) {
+            esp_ota_abort(ota_handle);
+            free(buffer);
+            ESP_LOGE(TAG, "OTA body read failed after %d bytes", received);
+            httpd_resp_set_status(req, "400 Bad Request");
+            return httpd_resp_sendstr(req, "{\"type\":\"ota\",\"updated\":false,\"error\":\"firmware upload read failed\"}");
+        }
+        err = esp_ota_write(ota_handle, buffer, read_len);
+        if (err != ESP_OK) {
+            esp_ota_abort(ota_handle);
+            free(buffer);
+            ESP_LOGE(TAG, "OTA write failed after %d bytes err=%s",
+                     received, esp_err_to_name(err));
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            return httpd_resp_sendstr(req, "{\"type\":\"ota\",\"updated\":false,\"error\":\"OTA write failed\"}");
+        }
+        remaining -= read_len;
+        received += read_len;
+    }
+    free(buffer);
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA end failed err=%s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"type\":\"ota\",\"updated\":false,\"error\":\"invalid firmware image\"}");
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA set boot partition failed err=%s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"type\":\"ota\",\"updated\":false,\"error\":\"set boot partition failed\"}");
+    }
+
+    persistent_log_event("info", "ota", "firmware uploaded partition=%s bytes=%d",
+                         update_partition->label, received);
+    esp_err_t send_err = httpd_resp_sendstr(req,
+        "{\"type\":\"ota\",\"updated\":true,\"rebooting\":true}");
+    xTaskCreate(ota_restart_task, "ota_restart", 2048, NULL, 3, NULL);
+    return send_err;
+}
+
 static esp_err_t start_http_server(bool setup_mode)
 {
     if (http_server != NULL) {
@@ -1795,7 +1935,7 @@ static esp_err_t start_http_server(bool setup_mode)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.stack_size = 8192;
-    config.max_uri_handlers = 48;
+    config.max_uri_handlers = 53;
     config.uri_match_fn = httpd_uri_match_wildcard;
 
     ESP_RETURN_ON_ERROR(httpd_start(&http_server, &config), TAG, "HTTP start failed");
@@ -1803,16 +1943,9 @@ static esp_err_t start_http_server(bool setup_mode)
     const httpd_uri_t root = {
         .uri = "/",
         .method = HTTP_GET,
-        .handler = setup_mode ? setup_root_get_handler : dashboard_root_get_handler,
+        .handler = setup_mode ? root_get_handler : dashboard_root_get_handler,
     };
     httpd_register_uri_handler(http_server, &root);
-
-    const httpd_uri_t logs = {
-        .uri = "/logs",
-        .method = HTTP_GET,
-        .handler = logs_get_handler,
-    };
-    httpd_register_uri_handler(http_server, &logs);
 
     const httpd_uri_t latest = {
         .uri = "/latest",
@@ -1841,6 +1974,13 @@ static esp_err_t start_http_server(bool setup_mode)
         .handler = api_bike_get_handler,
     };
     httpd_register_uri_handler(http_server, &api_bike);
+
+    const httpd_uri_t api_bike_history = {
+        .uri = "/api/bike/history",
+        .method = HTTP_GET,
+        .handler = api_bike_history_get_handler,
+    };
+    httpd_register_uri_handler(http_server, &api_bike_history);
 
     const httpd_uri_t api_state = {
         .uri = "/api/state",
@@ -1968,20 +2108,6 @@ static esp_err_t start_http_server(bool setup_mode)
     };
     httpd_register_uri_handler(http_server, &api_hue_clear);
 
-    const httpd_uri_t bike_log = {
-        .uri = "/bike-log",
-        .method = HTTP_GET,
-        .handler = persistent_log_get_handler,
-    };
-    httpd_register_uri_handler(http_server, &bike_log);
-
-    const httpd_uri_t bike_log_previous = {
-        .uri = "/bike-log/previous",
-        .method = HTTP_GET,
-        .handler = persistent_log_previous_get_handler,
-    };
-    httpd_register_uri_handler(http_server, &bike_log_previous);
-
     const httpd_uri_t scan = {
         .uri = "/scan",
         .method = HTTP_GET,
@@ -2012,12 +2138,18 @@ static esp_err_t start_http_server(bool setup_mode)
         .method = HTTP_POST,
         .handler = led_config_post_handler,
     };
+    const httpd_uri_t ota = {
+        .uri = "/ota",
+        .method = HTTP_POST,
+        .handler = ota_post_handler,
+    };
     httpd_register_uri_handler(http_server, &scan);
     httpd_register_uri_handler(http_server, &save);
     httpd_register_uri_handler(http_server, &device_name);
     httpd_register_uri_handler(http_server, &export_config);
     httpd_register_uri_handler(http_server, &ha_config);
     httpd_register_uri_handler(http_server, &led_config);
+    httpd_register_uri_handler(http_server, &ota);
 
     if (!setup_mode) {
         ESP_LOGI(TAG, "log web service started; url=http://%s.local/ or device IP", WIFI_ADMIN_HOSTNAME);

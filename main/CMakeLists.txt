@@ -3,6 +3,7 @@ idf_component_register(
         "app_main.c"
         "accessory_config.c"
         "automation.c"
+        "bike_history.c"
         "ble_gap.c"
         "gatt_client.c"
         "home_assistant.c"
@@ -21,6 +22,7 @@ idf_component_register(
         esp_http_server
         esp_http_client
         esp_netif
+        app_update
         json
         mdns
         mqtt

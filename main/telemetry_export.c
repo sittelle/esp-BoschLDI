@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "accessory_config.h"
+#include "bike_history.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -19,8 +20,9 @@
 
 #define EXPORT_POLL_INTERVAL_MS 5000
 #define EXPORT_LOG_BUFFER_SIZE 8192
-#define EXPORT_JSON_BUFFER_SIZE 20000
+#define EXPORT_JSON_BUFFER_SIZE 120000
 #define EXPORT_BIKE_JSON_SIZE 1536
+#define EXPORT_BIKE_HISTORY_JSON_SIZE 95000
 #define EXPORT_HTTP_TIMEOUT_MS 3000
 
 static const char *TAG = "telemetry_export";
@@ -108,20 +110,46 @@ static void export_logs(const accessory_export_config_t *config, const char *dev
 static void export_bike_data(const accessory_export_config_t *config, const char *device_name)
 {
     char bike_json[EXPORT_BIKE_JSON_SIZE];
-    bool has_data = live_data_latest_json(bike_json, sizeof(bike_json));
-    char payload[EXPORT_BIKE_JSON_SIZE + 256];
+    char *history_json = malloc(EXPORT_BIKE_HISTORY_JSON_SIZE);
+    char *payload = malloc(EXPORT_JSON_BUFFER_SIZE);
+    if (history_json == NULL || payload == NULL) {
+        free(history_json);
+        free(payload);
+        return;
+    }
 
-    snprintf(payload, sizeof(payload),
-             "{\"type\":\"bike_data\",\"device_name\":\"%s\",\"boot_ms\":%lld,"
-             "\"interval_sec\":%" PRIu32 ",\"has_data\":%s,\"data\":%s}",
-             device_name, (long long)(esp_timer_get_time() / 1000),
-             config->bike_interval_sec, has_data ? "true" : "false",
-             has_data ? bike_json : "{}");
+    bool has_data = live_data_latest_json(bike_json, sizeof(bike_json));
+    bool has_history = bike_history_has_records() &&
+                       bike_history_export_json(history_json,
+                                                EXPORT_BIKE_HISTORY_JSON_SIZE) == ESP_OK;
+
+    int written = snprintf(payload, EXPORT_JSON_BUFFER_SIZE,
+                           "{\"type\":\"bike_data\",\"device_name\":\"%s\",\"boot_ms\":%lld,"
+                           "\"interval_sec\":%" PRIu32 ",\"has_data\":%s,\"data\":%s,"
+                           "\"history\":%s}",
+                           device_name, (long long)(esp_timer_get_time() / 1000),
+                           config->bike_interval_sec, has_data ? "true" : "false",
+                           has_data ? bike_json : "{}",
+                           has_history ? history_json : "null");
+    if (written < 0 || written >= EXPORT_JSON_BUFFER_SIZE) {
+        ESP_LOGW(TAG, "bike data export payload too large");
+        free(history_json);
+        free(payload);
+        return;
+    }
 
     esp_err_t err = post_json(config->bike_url, payload);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "bike data export failed; err=%s", esp_err_to_name(err));
+    } else if (has_history) {
+        err = bike_history_clear();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "bike history clear after export failed; err=%s", esp_err_to_name(err));
+        }
     }
+
+    free(history_json);
+    free(payload);
 }
 
 static void telemetry_export_task(void *arg)

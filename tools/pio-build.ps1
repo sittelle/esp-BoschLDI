@@ -43,8 +43,12 @@ if ((Test-Path $pioPenvPython) -and !(Test-Path $pioPenvUv)) {
         Where-Object { $_.FullName -notlike "$pioPenvScripts*" } |
         Select-Object -First 1
     if ($candidateUv) {
-        Copy-Item -LiteralPath $candidateUv.FullName -Destination $pioPenvUv -Force
-        Write-Host "Restored missing PlatformIO penv uv.exe from $($candidateUv.FullName)."
+        try {
+            Copy-Item -LiteralPath $candidateUv.FullName -Destination $pioPenvUv -Force
+            Write-Host "Restored missing PlatformIO penv uv.exe from $($candidateUv.FullName)."
+        } catch {
+            Write-Warning "Could not restore PlatformIO penv uv.exe from $($candidateUv.FullName): $($_.Exception.Message)"
+        }
     }
 }
 $idfPath = Join-Path $env:USERPROFILE ".platformio\packages\framework-espidf"
@@ -67,6 +71,60 @@ if (Test-Path $pioPenvSitePackages) {
         $env:PYTHONPATH = "$pioPenvSitePackages$([System.IO.Path]::PathSeparator)$env:PYTHONPATH"
     }
 }
+
+function Ensure-PenvModuleFromUvCache {
+    param(
+        [string]$ModuleName,
+        [string]$DistInfoPrefix
+    )
+
+    if (!(Test-Path $pioPenvPython) -or !(Test-Path $pioPenvSitePackages)) {
+        return
+    }
+
+    & $pioPenvPython -c "import $ModuleName" 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        return
+    }
+
+    $platformioRoot = Join-Path $env:USERPROFILE ".platformio"
+    $archiveRoot = Join-Path $platformioRoot ".cache\uv\archive-v0"
+    if (!(Test-Path $archiveRoot)) {
+        Write-Warning "PlatformIO penv is missing Python module '$ModuleName', and uv archive cache was not found."
+        return
+    }
+
+    $abiTag = & $pioPenvPython -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
+    $candidates = Get-ChildItem -LiteralPath $archiveRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object {
+            (Test-Path (Join-Path $_.FullName $ModuleName)) -and
+            (Get-ChildItem -LiteralPath $_.FullName -Directory -Filter "$DistInfoPrefix*.dist-info" -ErrorAction SilentlyContinue)
+        }
+
+    $selected = $null
+    foreach ($candidate in $candidates) {
+        $modulePath = Join-Path $candidate.FullName $ModuleName
+        $nativeFiles = Get-ChildItem -LiteralPath $modulePath -Recurse -File -Include "*.pyd", "*.so" -ErrorAction SilentlyContinue
+        if (!$nativeFiles -or ($nativeFiles | Where-Object { $_.Name -like "*$abiTag*" })) {
+            $selected = $candidate
+            break
+        }
+    }
+
+    if (!$selected) {
+        Write-Warning "PlatformIO penv is missing Python module '$ModuleName', and no compatible uv archive package was found."
+        return
+    }
+
+    Copy-Item -LiteralPath (Join-Path $selected.FullName $ModuleName) -Destination $pioPenvSitePackages -Recurse -Force
+    Get-ChildItem -LiteralPath $selected.FullName -Directory -Filter "$DistInfoPrefix*.dist-info" -ErrorAction SilentlyContinue |
+        ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $pioPenvSitePackages -Recurse -Force }
+    Write-Host "Restored PlatformIO penv Python module '$ModuleName' from uv cache."
+}
+
+Ensure-PenvModuleFromUvCache -ModuleName "certifi" -DistInfoPrefix "certifi-"
+Ensure-PenvModuleFromUvCache -ModuleName "littlefs" -DistInfoPrefix "littlefs_python-"
+Ensure-PenvModuleFromUvCache -ModuleName "fatfs" -DistInfoPrefix "fatfs_ng-"
 function Repair-Esp32S3Toolchain {
     param([string]$BuildDirectory)
 

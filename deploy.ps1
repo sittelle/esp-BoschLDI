@@ -53,7 +53,8 @@ Write-Host "Baud:        $Baud"
 
 if (!$SkipBuild) {
     Write-Step "Building firmware"
-    & $buildScript -Environment $Environment -Target "app" -Clean:$Clean -Configure:$Configure
+    $buildTarget = if ($Full) { "all" } else { "app" }
+    & $buildScript -Environment $Environment -Target $buildTarget -Clean:$Clean -Configure:$Configure
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
@@ -66,7 +67,7 @@ Write-Step "Flashing firmware"
     -Port $Port `
     -Environment $Environment `
     -Baud $Baud `
-    -SkipBuild:$SkipBuild `
+    -SkipBuild `
     -AppOnly:(!$Full) `
     -Clean:$Clean `
     -Configure:$Configure

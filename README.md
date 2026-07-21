@@ -117,6 +117,8 @@ Useful deployment options:
 - `-NoVerify`: skip the post-flash web check
 - `-VerifyUrl http://192.168.x.y/config`: verify by IP when mDNS is unavailable
 
+After pulling a version that introduces OTA partitions, run one full flash with `-Full -Configure` so the new partition table is installed. App-only flashing cannot install a changed partition table.
+
 Low-level build and flash:
 
 ```powershell
@@ -178,6 +180,7 @@ The configured device name is used for the BLE accessory relationship with the b
 Read endpoints:
 
 - `GET /api/bike`: latest decoded bike state as JSON
+- `GET /api/bike/history?field=6`: latest bounded history points for one bike field; field IDs match the compact history map
 - `GET /api/logs`: runtime log ring as JSON
 - `GET /api/state`: bike state and runtime logs in one JSON response
 - `GET /api/automation/rules`: current bike-to-Hue automation rules
@@ -188,10 +191,8 @@ Read endpoints:
 - `GET /api/hue/resources`: full local Hue Bridge v1 state for debugging
 - `GET /config`: current device name, push export, Home Assistant MQTT, LED, and Wi-Fi status settings
 - `GET /scan`: nearby Wi-Fi networks as JSON
-- `GET /logs`: runtime logs as plain text
 - `GET /latest`: latest decoded bike state as plain text
-- `GET /bike-log`: current persistent bike/connection log file
-- `GET /bike-log/previous`: previous rotated persistent log file
+- `POST /ota`: raw PlatformIO application `.bin` body; writes to the next OTA slot and reboots on success
 
 Configuration endpoints use `application/x-www-form-urlencoded` form bodies:
 
@@ -219,6 +220,9 @@ Configuration endpoints use `application/x-www-form-urlencoded` form bodies:
   - `led_enabled`: optional checkbox value; omitted means off
   - `led_brightness_percent`: clamped to 1-100
   - `led_boot_color`, `led_advertising_color`, `led_connected_color`, `led_secured_color`, `led_ready_color`, `led_activity_color`, `led_error_color`: `#RRGGBB`
+- `POST /ota`
+  - Raw request body must be the PlatformIO app binary, usually `.pio/build/esp32s3/bosch_ldi_accessory.bin`.
+  - The firmware writes to the inactive OTA partition, marks it as the next boot partition, and reboots after a successful response.
 - `POST /api/hue/pair`
   - `bridge_host`: optional bridge IP/host; if empty, the first discovered bridge is used
 - `POST /api/hue/pair/start`
@@ -242,6 +246,16 @@ Configuration endpoints use `application/x-www-form-urlencoded` form bodies:
   - Clears the locally stored Hue Bridge host and app key
 
 Empty push URLs disable push export.
+
+## OTA Updates
+
+OTA uses the ESP-IDF OTA partition flow with a factory app plus two OTA slots. Install the OTA-capable partition table once:
+
+```powershell
+.\deploy.ps1 -Port COMx -Full -Configure
+```
+
+After that, open **Configuration -> Firmware** and upload `.pio/build/esp32s3/bosch_ldi_accessory.bin`. The device reboots into the uploaded image after the update succeeds.
 
 ## Home Assistant
 
@@ -272,6 +286,8 @@ Push export is optional and intended for slower background forwarding. The firmw
 - Logs: minimum 60 seconds
 - Bike data: minimum 10 seconds
 - Maximum interval: 3600 seconds
+
+When a bike push URL is configured, the bike payload also includes a compact binary history block if stored samples are pending. The firmware sends this history on the normal bike push interval and clears the local binary history only after the HTTP POST succeeds.
 
 ## Philips Hue Integration
 
@@ -332,12 +348,24 @@ Next steps for plug control and automation:
 
 Partition layout:
 
-- NVS: 24 KB
+- NVS: 16 KB
+- OTA data: 8 KB
 - PHY init: 4 KB
-- App partition: 4 MB
-- SPIFFS storage: 256 KB
+- Factory app: 4 MB
+- OTA slot 0: 4 MB
+- OTA slot 1: 4 MB
+- SPIFFS storage: 1 MB
 
-SPIFFS stores persistent bike/connection logs. The firmware keeps a current file and one previous rotated file. Runtime logs shown in the UI are primarily from an in-memory ring buffer, not flash. Optional JSON push export for runtime logs and bike data is skipped while station Wi-Fi is disconnected.
+SPIFFS stores persistent bike/connection logs and a compact bike-data history ring. The firmware keeps a current human-readable log file and one previous rotated file. Runtime logs shown in the UI are primarily from an in-memory ring buffer, not flash. Optional JSON push export for runtime logs and bike data is skipped while station Wi-Fi is disconnected.
+
+Bike history is stored in `/spiffs/bike_history.bin` as a fixed-size 64 KiB binary ring. Each record is 10 bytes:
+
+- `unix_time`: 4 bytes, little-endian unsigned integer
+- `value`: 4 bytes, little-endian signed/integer payload
+- `field_id`: 1 byte, hardcoded firmware mapping
+- `value_type`: 1 byte, `1=u32`, `2=i32`, `3=bool`
+
+Known field IDs are `1=time`, `2=speed_centi_kmh`, `3=cadence_rpm`, `4=rider_power_w`, `5=ambient_millilux`, `6=battery_soc`, `7=odometer_m`, `8=bike_light`, `9=system_locked`, `10=charger_connected`, `11=light_reserve_state`, `12=diagnosis_active`, and `13=bike_not_driving`. The ring stores every known field present in each bike notification, even if its value did not change. The bike push payload exports this binary history as base64 in `history.data_base64`.
 
 Generated firmware binaries, build output, managed components, runtime logs, and local/private files are ignored by git.
 

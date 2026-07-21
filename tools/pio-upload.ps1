@@ -67,12 +67,20 @@ if (!(Test-Path $pioPython)) {
 }
 
 if ($AppOnly) {
-    & $pioPython -m esptool --chip esp32s3 --port $Port --baud $Baud --before default-reset --after watchdog-reset write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB `
+    & $pioPython -m esptool --chip esp32s3 --port $Port --baud $Baud --before default-reset --after no-reset erase-region 0xd000 0x2000
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+    & $pioPython -m esptool --chip esp32s3 --port $Port --baud $Baud --before default-reset --after no-reset write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB `
         0x10000 ".pio\build\$Environment\bosch_ldi_accessory.bin"
     exit $LASTEXITCODE
 }
 
-& $pioPython -m esptool --chip esp32s3 --port $Port --baud $Baud --before default-reset --after watchdog-reset write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB `
+& $pioPython -m esptool --chip esp32s3 --port $Port --baud $Baud --before default-reset --after no-reset erase-region 0xd000 0x2000
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+& $pioPython -m esptool --chip esp32s3 --port $Port --baud $Baud --before default-reset --after no-reset write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB `
     0x0 ".pio\build\$Environment\bootloader\bootloader.bin" `
     0x8000 ".pio\build\$Environment\partition_table\partition-table.bin" `
     0x10000 ".pio\build\$Environment\bosch_ldi_accessory.bin"
